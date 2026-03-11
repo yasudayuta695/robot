@@ -6,9 +6,9 @@ import numpy as np
 from picamera2 import Picamera2
 
 # --- ネットワーク設定 ---
-PC_IP = "192.168.23.204"  # 画像を受信するPCのIPアドレス（★要確認）
-CAMERA_PORT = 5556        # カメラ用のポート（PC側と合わせる）
+CAMERA_PORT = 5556        # カメラ用のポート
 MOTOR_PORT = 5555         # モーター用のポート
+# （PCのIPアドレスはもう不要になりました！）
 
 # --- モーター（GPIO）の設定 ---
 GPIO.setmode(GPIO.BOARD)
@@ -23,7 +23,6 @@ pwm_b = GPIO.PWM(MB_PWM, 100)
 pwm_a.start(0)
 pwm_b.start(0)
 
-# 正しい動きをするように修正したモーター制御関数
 def set_left_motor(speed):
     if speed > 0:
         GPIO.output(MB_IN1, GPIO.HIGH)
@@ -48,33 +47,31 @@ def set_right_motor(speed):
         GPIO.output(MA_IN2, GPIO.LOW)
     pwm_a.ChangeDutyCycle(min(abs(speed), 100))
 
-# --- プログラム全体の実行状態 ---
 running = True
 
-# --- カメラ配信用の別スレッド ---
+# --- カメラ配信スレッド ---
 def camera_thread():
     ctx = zmq.Context()
-    sock = ctx.socket(zmq.REQ)
-    sock.connect(f"tcp://{PC_IP}:{CAMERA_PORT}")
+    # 垂れ流し(PUSH)モードに変更し、ラズパイ側でポートを開いて待機(bind)
+    sock = ctx.socket(zmq.PUSH)
+    sock.bind(f"tcp://*:{CAMERA_PORT}")
     
     picam2 = Picamera2()
     config = picam2.create_still_configuration(main={"size": (640, 480)})
     picam2.configure(config)
     picam2.start()
     
-    print("カメラ配信スレッド起動...")
+    print("カメラ配信スレッド起動（PCからの接続待機中...）")
     try:
         while running:
             img = picam2.capture_array()
             height, width = img.shape[:2]
             ndim = img.ndim
 
-            # 画像データを送信
+            # 映像データを送信（受け取りの確認は待たない）
             data = [np.array([height]), np.array([width]), np.array([ndim]), img.data]
             sock.send_multipart(data)
             
-            # PCからの受信確認（OK）を待つ
-            sock.recv_string()
     except Exception as e:
         print(f"カメラ処理でエラー: {e}")
     finally:
@@ -83,11 +80,9 @@ def camera_thread():
 
 # --- メイン処理（モーター受信） ---
 if __name__ == "__main__":
-    # カメラ処理を裏側（別スレッド）でスタートさせる
     cam_thread = threading.Thread(target=camera_thread, daemon=True)
     cam_thread.start()
 
-    # モーター受信用のZeroMQ準備
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     socket.bind(f"tcp://*:{MOTOR_PORT}")
@@ -95,7 +90,6 @@ if __name__ == "__main__":
 
     try:
         while running:
-            # PCからの操縦コマンドを待つ
             cmd = socket.recv_string()
             try:
                 l_str, r_str = cmd.split(',')
@@ -110,7 +104,6 @@ if __name__ == "__main__":
         running = False
         
     finally:
-        # モーターを安全に停止
         pwm_a.stop()
         pwm_b.stop()
         GPIO.cleanup()
