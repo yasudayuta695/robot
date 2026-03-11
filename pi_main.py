@@ -53,11 +53,10 @@ running = True
 def camera_thread():
     ctx = zmq.Context()
     sock = ctx.socket(zmq.PUSH)
-    sock.setsockopt(zmq.CONFLATE, 1)  # ★追加：古い映像を捨てて最新1枚だけを送る！
+    sock.setsockopt(zmq.CONFLATE, 1)
     sock.bind(f"tcp://*:{CAMERA_PORT}")
     
     picam2 = Picamera2()
-    # ★変更：サイズを 320x240 に下げて通信量を劇的に軽くする！
     config = picam2.create_still_configuration(main={"size": (320, 240)})
     picam2.configure(config)
     picam2.start()
@@ -66,13 +65,10 @@ def camera_thread():
     try:
         while running:
             img = picam2.capture_array()
-            height, width = img.shape[:2]
-            ndim = img.ndim
-
-            data = [np.array([height]), np.array([width]), np.array([ndim]), img.data]
-            sock.send_multipart(data)
             
-            # ★追加：少しだけお休みを入れてWi-Fiのパンクを防ぐ (約30FPSに制限)
+            # ★修正: 分割送信をやめ、画像データ(bytes)だけを1つの塊として送る！
+            sock.send(img.tobytes())
+            
             time.sleep(0.03) 
             
     except Exception as e:
@@ -80,37 +76,6 @@ def camera_thread():
     finally:
         picam2.stop()
         sock.close()
-        
-def receiver_thread():
-    global image_data, running
-    
-    ctx = zmq.Context()
-    cam_socket = ctx.socket(zmq.PULL)
-    cam_socket.setsockopt(zmq.CONFLATE, 1) # ★追加：渋滞している古い映像を読み捨てる！
-    cam_socket.connect(f"tcp://{PI_IP}:{CAMERA_PORT}")
-    print("カメラ受信スレッド起動...")
-
-    while running:
-        try:
-            byte_rows, byte_cols, byte_mat_type, data = cam_socket.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.ZMQError:
-            time.sleep(0.01)
-            continue
-            
-        row = struct.unpack("q", byte_rows)[0]
-        cols = struct.unpack("q", byte_cols)
-        mat_type = struct.unpack("q", byte_mat_type)
-        
-        if mat_type[0] == 0:
-            img = np.frombuffer(data, dtype=np.uint8).reshape((row, cols[0]))
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        else:
-            img = np.frombuffer(data, dtype=np.uint8).reshape((row, cols[0], 3))
-            # ★削除：色が変な原因だった「cvtColor」の行を丸ごと消しました！
-            
-        # ★追加：ラズパイから来た軽い映像(320x240)を、画面サイズ(640x480)に引き伸ばす
-        img = cv2.resize(img, (640, 480))
-        image_data = img
 
 # --- メイン処理（モーター受信） ---
 if __name__ == "__main__":
