@@ -80,11 +80,7 @@ def camera_thread():
     finally:
         picam2.stop()
         sock.close()
-2. PC側（pc_app.py）の修正箇所
-receiver_thread の中を以下のように書き換えます。
-
-Python
-# --- カメラ受信スレッド ---
+        
 def receiver_thread():
     global image_data, running
     
