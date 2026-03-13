@@ -4,12 +4,11 @@ import math
 import cv2
 import numpy as np
 import threading
-import struct
 import time
 from PIL import Image, ImageTk
 
 # --- 設定 ---
-PI_IP = "192.168.23.162"  # ★Raspberry PiのIPアドレス（確認してください）
+PI_IP = "192.168.23.162"  # Raspberry PiのIPアドレス
 CENTER = 150
 RADIUS = 120
 STICK_RADIUS = 30
@@ -18,13 +17,8 @@ CAMERA_PORT = 5556        # カメラ用ポート
 MOTOR_PORT = 5555         # モーター用ポート
 LEFT_SIGN = 1             # 左モーター配線に応じて 1 / -1 を切替
 RIGHT_SIGN = 1            # 右モーター配線に応じて 1 / -1 を切替
-PIVOT_Y_THRESHOLD = 0.2  # この値より水平に近いときだけその場旋回を許可
-PIVOT_TURN_GAIN = 0.2     # その場旋回時の旋回量
-DRIVE_SPEED = 80         # 走行時の基準速度（倒し量ではなく方向だけを使う）
-REVERSE_SPEED_SCALE = 0.8 # 後退時のみ速度を抑える係数
-REVERSE_STRAIGHT_X_THRESHOLD = 0.2  # |x|が小さい真後ろ寄りのときだけ後退減速
-OUTER_SPEED_SCALE = 1.2   # 斜め走行時の外輪倍率
-INNER_SPEED_SCALE = 1.0   # 斜め走行時の内輪倍率
+PIVOT_Y_THRESHOLD = 0.05  # この値より水平に近いときだけその場旋回を許可
+PIVOT_TURN_GAIN = 1.0     # その場旋回時の旋回量
 
 image_data = np.zeros((480, 640, 3), dtype=np.uint8)
 running = True
@@ -46,15 +40,13 @@ def receiver_thread():
 
     while running:
         try:
-            # ★修正: recv_multipart ではなく、通常の recv で1つの塊を受け取る！
             data = cam_socket.recv(flags=zmq.NOBLOCK)
         except zmq.ZMQError:
             time.sleep(0.01)
             continue
             
         try:
-            # ★修正: 届いたデータをそのまま 320x240 の画像に復元する！
-            # (縦240, 横320, 色3チャンネル)
+            # 届いたデータをそのまま 320x240 の画像に復元する
             img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
             
             # 画面用に 640x480 に引き伸ばす
@@ -62,7 +54,6 @@ def receiver_thread():
             
             image_data = img
         except Exception as e:
-            # 万が一通信のゴミが混ざって変換失敗した時は無視して次へ
             pass
 
 # --- GUIアプリケーション ---
@@ -75,19 +66,27 @@ class UnifiedApp:
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(padx=10, pady=10)
 
+        # 【左側】カメラ映像表示用ラベル
         self.camera_label = tk.Label(self.main_frame, bg="black", width=640, height=480)
         self.camera_label.pack(side=tk.LEFT, padx=10)
 
+        # 【右側】ジョイスティックとスライダー用フレーム
         self.joy_frame = tk.Frame(self.main_frame)
         self.joy_frame.pack(side=tk.LEFT, padx=10)
         
         self.canvas = tk.Canvas(self.joy_frame, width=CENTER*2, height=CENTER*2, bg="white")
-        self.canvas.pack(pady=20)
+        self.canvas.pack(pady=10)
 
         self.canvas.create_oval(CENTER-RADIUS, CENTER-RADIUS, CENTER+RADIUS, CENTER+RADIUS, outline="gray")
         self.canvas.create_oval(CENTER-DEADZONE, CENTER-DEADZONE, CENTER+DEADZONE, CENTER+DEADZONE, outline="lightgray", dash=(4, 4))
         self.stick = self.canvas.create_oval(CENTER-STICK_RADIUS, CENTER-STICK_RADIUS, 
                                              CENTER+STICK_RADIUS, CENTER+STICK_RADIUS, fill="blue")
+
+        # ★追加: 最高速度を調整するスライダー (10% 〜 100%)
+        self.speed_scale = tk.Scale(self.joy_frame, from_=10, to=100, orient=tk.HORIZONTAL, 
+                                    label="最高速度 (Max Speed %)", length=CENTER*2)
+        self.speed_scale.set(100) # デフォルトは100%
+        self.speed_scale.pack(pady=10)
 
         self.current_cmd = "0,0"
         
@@ -127,40 +126,40 @@ class UnifiedApp:
             self.send_command(0, 0)
             return
 
-        # 方向のみを使うため、単位ベクトルに変換する
-        dir_mag = math.sqrt(dx * dx + dy * dy)
-        dir_x = dx / max(dir_mag, 1e-6)
-        dir_y = dy / max(dir_mag, 1e-6)
+        norm_x = dx / RADIUS
+        norm_y = dy / RADIUS
 
         # 前後の基準速度（前:正, 後:負）
-        # 2乗カーブではなく一次にして、斜め入力時の失速を抑える
-        base_speed = int((-dir_y) * DRIVE_SPEED)
-        if base_speed < 0 and abs(dir_x) < REVERSE_STRAIGHT_X_THRESHOLD:
-            base_speed = int(base_speed * REVERSE_SPEED_SCALE)
+        base_speed = int((-norm_y * abs(norm_y)) * 100)
 
         # 真横付近はその場旋回
-        if abs(dir_y) < PIVOT_Y_THRESHOLD:
-            turn = int((dir_x * abs(dir_x)) * DRIVE_SPEED * PIVOT_TURN_GAIN)
+        if abs(norm_y) < PIVOT_Y_THRESHOLD:
+            turn = int((norm_x * abs(norm_x)) * 100 * PIVOT_TURN_GAIN)
             l_speed = turn
             r_speed = -turn
         else:
             # 走行中は外輪を基準速度のまま、内輪のみ0へ近づける
-            # angle_scale = cos(theta) = |y| / sqrt(x^2 + y^2)
-            angle_scale = abs(dir_y)
+            mag = math.sqrt(norm_x * norm_x + norm_y * norm_y)
+            angle_scale = abs(norm_y) / max(mag, 1e-6)
 
-            outer = int(base_speed * OUTER_SPEED_SCALE)
-            inner = int(base_speed * angle_scale * INNER_SPEED_SCALE)
+            outer = base_speed
+            inner = int(base_speed * angle_scale)
 
-            if dir_x > 0:  # 右へ曲がる: 右輪を内輪にする
+            if norm_x > 0:  # 右へ曲がる
                 l_speed = outer
                 r_speed = inner
-            else:           # 左へ曲がる: 左輪を内輪にする
+            else:           # 左へ曲がる
                 l_speed = inner
                 r_speed = outer
 
         # モーター配線や取付方向の差をここで吸収
         l_speed *= LEFT_SIGN
         r_speed *= RIGHT_SIGN
+
+        # ★追加: スライダーの値（割合）を取得して、最終的な速度に掛け算する
+        speed_rate = self.speed_scale.get() / 100.0
+        l_speed = int(l_speed * speed_rate)
+        r_speed = int(r_speed * speed_rate)
 
         l_speed = max(-100, min(100, l_speed))
         r_speed = max(-100, min(100, r_speed))
