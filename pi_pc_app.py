@@ -15,10 +15,6 @@ STICK_RADIUS = 30
 DEADZONE = 25
 CAMERA_PORT = 5556        # カメラ用ポート
 MOTOR_PORT = 5555         # モーター用ポート
-LEFT_SIGN = 1             # 左モーター配線に応じて 1 / -1 を切替
-RIGHT_SIGN = 1            # 右モーター配線に応じて 1 / -1 を切替
-PIVOT_Y_THRESHOLD = 0.05  # この値より水平に近いときだけその場旋回を許可
-PIVOT_TURN_GAIN = 1.0     # その場旋回時の旋回量
 
 image_data = np.zeros((480, 640, 3), dtype=np.uint8)
 running = True
@@ -46,12 +42,8 @@ def receiver_thread():
             continue
             
         try:
-            # 届いたデータをそのまま 320x240 の画像に復元する
             img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
-            
-            # 画面用に 640x480 に引き伸ばす
             img = cv2.resize(img, (640, 480))
-            
             image_data = img
         except Exception as e:
             pass
@@ -66,11 +58,9 @@ class UnifiedApp:
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(padx=10, pady=10)
 
-        # 【左側】カメラ映像表示用ラベル
         self.camera_label = tk.Label(self.main_frame, bg="black", width=640, height=480)
         self.camera_label.pack(side=tk.LEFT, padx=10)
 
-        # 【右側】ジョイスティックとスライダー用フレーム
         self.joy_frame = tk.Frame(self.main_frame)
         self.joy_frame.pack(side=tk.LEFT, padx=10)
         
@@ -82,7 +72,7 @@ class UnifiedApp:
         self.stick = self.canvas.create_oval(CENTER-STICK_RADIUS, CENTER-STICK_RADIUS, 
                                              CENTER+STICK_RADIUS, CENTER+STICK_RADIUS, fill="blue")
 
-        # ★追加: 最高速度を調整するスライダー (10% 〜 100%)
+        # 最高速度を調整するスライダー (10% 〜 100%)
         self.speed_scale = tk.Scale(self.joy_frame, from_=10, to=100, orient=tk.HORIZONTAL, 
                                     label="最高速度 (Max Speed %)", length=CENTER*2)
         self.speed_scale.set(100) # デフォルトは100%
@@ -107,7 +97,7 @@ class UnifiedApp:
         cmd = f"{l_speed},{r_speed}"
         if cmd != self.current_cmd:
             motor_socket.send_string(cmd)
-            # print(f"送信: 左 {l_speed}%, 右 {r_speed}%") # ログが多すぎる場合はコメントアウト
+            # print(f"送信: 左 {l_speed}%, 右 {r_speed}%") # ログを見たい場合は最初の # を消してください
             self.current_cmd = cmd
 
     def drag(self, event):
@@ -129,34 +119,17 @@ class UnifiedApp:
         norm_x = dx / RADIUS
         norm_y = dy / RADIUS
 
-        # 前後の基準速度（前:正, 後:負）
-        base_speed = int((-norm_y * abs(norm_y)) * 100)
+        # ★元々の完璧だった計算式を復活！
+        steering = int((norm_x * abs(norm_x)) * 100)
+        throttle = -int((norm_y * abs(norm_y)) * 100)
+        
+        # 旋回がシビアすぎないように少し弱める
+        steering = int(steering * 0.7)
 
-        # 真横付近はその場旋回
-        if abs(norm_y) < PIVOT_Y_THRESHOLD:
-            turn = int((norm_x * abs(norm_x)) * 100 * PIVOT_TURN_GAIN)
-            l_speed = turn
-            r_speed = -turn
-        else:
-            # 走行中は外輪を基準速度のまま、内輪のみ0へ近づける
-            mag = math.sqrt(norm_x * norm_x + norm_y * norm_y)
-            angle_scale = abs(norm_y) / max(mag, 1e-6)
+        l_speed = -throttle - steering
+        r_speed = throttle - steering
 
-            outer = base_speed
-            inner = int(base_speed * angle_scale)
-
-            if norm_x > 0:  # 右へ曲がる
-                l_speed = outer
-                r_speed = inner
-            else:           # 左へ曲がる
-                l_speed = inner
-                r_speed = outer
-
-        # モーター配線や取付方向の差をここで吸収
-        l_speed *= LEFT_SIGN
-        r_speed *= RIGHT_SIGN
-
-        # ★追加: スライダーの値（割合）を取得して、最終的な速度に掛け算する
+        # ★スライダーの値を掛け算して速度を抑える
         speed_rate = self.speed_scale.get() / 100.0
         l_speed = int(l_speed * speed_rate)
         r_speed = int(r_speed * speed_rate)
