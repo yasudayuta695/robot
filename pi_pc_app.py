@@ -16,6 +16,10 @@ STICK_RADIUS = 30
 DEADZONE = 25
 CAMERA_PORT = 5556        # カメラ用ポート
 MOTOR_PORT = 5555         # モーター用ポート
+LEFT_SIGN = 1             # 左モーター配線に応じて 1 / -1 を切替
+RIGHT_SIGN = 1            # 右モーター配線に応じて 1 / -1 を切替
+PIVOT_Y_THRESHOLD = 0.05  # この値より水平に近いときだけその場旋回を許可
+PIVOT_TURN_GAIN = 1.0     # その場旋回時の旋回量
 
 image_data = np.zeros((480, 640, 3), dtype=np.uint8)
 running = True
@@ -121,12 +125,33 @@ class UnifiedApp:
         norm_x = dx / RADIUS
         norm_y = dy / RADIUS
 
-        steering = int((norm_x * abs(norm_x)) * 100)
-        throttle = -int((norm_y * abs(norm_y)) * 100)
-        steering = int(steering * 0.7)
+        # 前後の基準速度（前:正, 後:負）
+        base_speed = int((-norm_y * abs(norm_y)) * 100)
 
-        l_speed = -throttle - steering
-        r_speed = throttle - steering
+        # 真横付近はその場旋回
+        if abs(norm_y) < PIVOT_Y_THRESHOLD:
+            turn = int((norm_x * abs(norm_x)) * 100 * PIVOT_TURN_GAIN)
+            l_speed = turn
+            r_speed = -turn
+        else:
+            # 走行中は外輪を基準速度のまま、内輪のみ0へ近づける
+            # angle_scale = cos(theta) = |y| / sqrt(x^2 + y^2)
+            mag = math.sqrt(norm_x * norm_x + norm_y * norm_y)
+            angle_scale = abs(norm_y) / max(mag, 1e-6)
+
+            outer = base_speed
+            inner = int(base_speed * angle_scale)
+
+            if norm_x > 0:  # 右へ曲がる: 右輪を内輪にする
+                l_speed = outer
+                r_speed = inner
+            else:           # 左へ曲がる: 左輪を内輪にする
+                l_speed = inner
+                r_speed = outer
+
+        # モーター配線や取付方向の差をここで吸収
+        l_speed *= LEFT_SIGN
+        r_speed *= RIGHT_SIGN
 
         l_speed = max(-100, min(100, l_speed))
         r_speed = max(-100, min(100, r_speed))
