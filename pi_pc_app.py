@@ -18,8 +18,13 @@ CAMERA_PORT = 5556        # カメラ用ポート
 MOTOR_PORT = 5555         # モーター用ポート
 LEFT_SIGN = 1             # 左モーター配線に応じて 1 / -1 を切替
 RIGHT_SIGN = 1            # 右モーター配線に応じて 1 / -1 を切替
-PIVOT_Y_THRESHOLD = 0.05  # この値より水平に近いときだけその場旋回を許可
-PIVOT_TURN_GAIN = 1.0     # その場旋回時の旋回量
+PIVOT_Y_THRESHOLD = 0.2  # この値より水平に近いときだけその場旋回を許可
+PIVOT_TURN_GAIN = 0.2     # その場旋回時の旋回量
+DRIVE_SPEED = 80         # 走行時の基準速度（倒し量ではなく方向だけを使う）
+REVERSE_SPEED_SCALE = 0.8 # 後退時のみ速度を抑える係数
+REVERSE_STRAIGHT_X_THRESHOLD = 0.2  # |x|が小さい真後ろ寄りのときだけ後退減速
+OUTER_SPEED_SCALE = 1.2   # 斜め走行時の外輪倍率
+INNER_SPEED_SCALE = 1.0   # 斜め走行時の内輪倍率
 
 image_data = np.zeros((480, 640, 3), dtype=np.uint8)
 running = True
@@ -122,27 +127,31 @@ class UnifiedApp:
             self.send_command(0, 0)
             return
 
-        norm_x = dx / RADIUS
-        norm_y = dy / RADIUS
+        # 方向のみを使うため、単位ベクトルに変換する
+        dir_mag = math.sqrt(dx * dx + dy * dy)
+        dir_x = dx / max(dir_mag, 1e-6)
+        dir_y = dy / max(dir_mag, 1e-6)
 
         # 前後の基準速度（前:正, 後:負）
-        base_speed = int((-norm_y * abs(norm_y)) * 100)
+        # 2乗カーブではなく一次にして、斜め入力時の失速を抑える
+        base_speed = int((-dir_y) * DRIVE_SPEED)
+        if base_speed < 0 and abs(dir_x) < REVERSE_STRAIGHT_X_THRESHOLD:
+            base_speed = int(base_speed * REVERSE_SPEED_SCALE)
 
         # 真横付近はその場旋回
-        if abs(norm_y) < PIVOT_Y_THRESHOLD:
-            turn = int((norm_x * abs(norm_x)) * 100 * PIVOT_TURN_GAIN)
+        if abs(dir_y) < PIVOT_Y_THRESHOLD:
+            turn = int((dir_x * abs(dir_x)) * DRIVE_SPEED * PIVOT_TURN_GAIN)
             l_speed = turn
             r_speed = -turn
         else:
             # 走行中は外輪を基準速度のまま、内輪のみ0へ近づける
             # angle_scale = cos(theta) = |y| / sqrt(x^2 + y^2)
-            mag = math.sqrt(norm_x * norm_x + norm_y * norm_y)
-            angle_scale = abs(norm_y) / max(mag, 1e-6)
+            angle_scale = abs(dir_y)
 
-            outer = base_speed
-            inner = int(base_speed * angle_scale)
+            outer = int(base_speed * OUTER_SPEED_SCALE)
+            inner = int(base_speed * angle_scale * INNER_SPEED_SCALE)
 
-            if norm_x > 0:  # 右へ曲がる: 右輪を内輪にする
+            if dir_x > 0:  # 右へ曲がる: 右輪を内輪にする
                 l_speed = outer
                 r_speed = inner
             else:           # 左へ曲がる: 左輪を内輪にする

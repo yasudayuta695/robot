@@ -9,8 +9,8 @@ from picamera2 import Picamera2
 CAMERA_PORT = 5556        # カメラ用のポート
 MOTOR_PORT = 5555         # モーター用のポート
 # （PCのIPアドレスはもう不要になりました！）
-CMD_LEFT_SIGN = 1         # 受信した左速度の符号補正: 1 または -1
-CMD_RIGHT_SIGN = -1       # 受信した右速度の符号補正: 1 または -1
+CMD_LEFT_SIGN = -1         # 受信した左速度の符号補正: 1 または -1
+CMD_RIGHT_SIGN = 1       # 受信した右速度の符号補正: 1 または -1
 
 # --- モーター（GPIO）の設定 ---
 GPIO.setmode(GPIO.BOARD)
@@ -96,8 +96,8 @@ if __name__ == "__main__":
                 l_str, r_str = cmd.split(',')
                 l_speed = int(l_str) * CMD_LEFT_SIGN
                 r_speed = int(r_str) * CMD_RIGHT_SIGN
-                set_left_motor(r_speed)
-                set_right_motor(l_speed)
+                set_left_motor(l_speed)
+                set_right_motor(r_speed)
             except ValueError:
                 set_left_motor(0)
                 set_right_motor(0)
