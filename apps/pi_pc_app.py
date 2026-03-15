@@ -336,9 +336,10 @@ class UnifiedApp:
         tk.Button(button_row, text="キャンセル", command=preview.destroy).pack(side=tk.LEFT)
 
     def get_final_base_dir(self) -> str:
-        cam_id = self.camera_var.get()
+        folder_name = self.recorder.get_output_folder_name()
+        camera_id = sanitize_for_dirname(self.camera_var.get())
         drive_type = sanitize_for_dirname(self.drive_type_var.get())
-        return os.path.join(self.config.save_base_dir, "datasets", "1_raw_data", cam_id, drive_type)
+        return os.path.join(self.config.save_base_dir, "dataset", camera_id, drive_type, folder_name)
 
     def commit_data(self) -> None:
         base_dir = self.get_final_base_dir()
@@ -347,6 +348,8 @@ class UnifiedApp:
             drive_type=self.drive_type_var.get(),
             drive_speed_base=self.get_drive_speed(),
             control_mode=self.control_mode.get(),
+            camera_id=self.camera_var.get(),
+            recording_duration_sec=self.recorder.get_recording_duration_sec(),
         )
         self.logger.info("データを %s に保存しました。", to_wsl_unc_path(base_dir, self.wsl_distro_name))
 

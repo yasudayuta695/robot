@@ -28,6 +28,11 @@ class DataRecorder:
         self.csv_file = None
         self.csv_writer = None
         self.last_save_time = 0.0
+        self.recording_session_id = ""
+        self.frame_sequence = 0
+        self.output_folder_name = ""
+        self.recording_started_at = None
+        self.recording_stopped_at = None
 
     def arm(self) -> None:
         if os.path.exists(self.temp_dir):
@@ -47,20 +52,42 @@ class DataRecorder:
 
         self.state = RecorderState.ARMED
         self.last_save_time = 0.0
+        self.recording_session_id = ""
+        self.frame_sequence = 0
+        self.output_folder_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.recording_started_at = None
+        self.recording_stopped_at = None
 
     def start_recording_if_needed(self, left_speed: int, right_speed: int) -> bool:
         if self.state == RecorderState.ARMED and (left_speed != 0 or right_speed != 0):
             self.state = RecorderState.RECORDING
             self.last_save_time = 0.0
+            self.recording_session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            self.frame_sequence = 0
+            self.recording_started_at = time.time()
+            self.recording_stopped_at = None
             return True
         return False
 
     def stop(self) -> None:
+        if self.state == RecorderState.RECORDING and self.recording_started_at is not None:
+            self.recording_stopped_at = time.time()
         if self.csv_file:
             self.csv_file.close()
             self.csv_file = None
         self.csv_writer = None
         self.state = RecorderState.IDLE
+
+    def get_output_folder_name(self) -> str:
+        if not self.output_folder_name:
+            self.output_folder_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return self.output_folder_name
+
+    def get_recording_duration_sec(self) -> float:
+        if self.recording_started_at is None:
+            return 0.0
+        end = self.recording_stopped_at if self.recording_stopped_at is not None else time.time()
+        return max(0.0, end - self.recording_started_at)
 
     def has_temp_data(self) -> bool:
         return os.path.exists(self.temp_csv_path)
@@ -93,33 +120,46 @@ class DataRecorder:
         if current_time - self.last_save_time < interval_sec:
             return
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-        filename = f"{timestamp}.jpg"
+        if not self.recording_session_id:
+            self.recording_session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+        filename = f"{self.recording_session_id}_{self.frame_sequence:06d}.jpg"
         filepath = os.path.join(self.temp_img_dir, filename)
 
         bgr_img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(filepath, bgr_img)
 
         self.csv_writer.writerow([
-            f"images/{filename}",
+            f"image/{filename}",
             left_speed,
             right_speed,
             drive_type,
             drive_speed_base,
             control_mode,
         ])
+        self.frame_sequence += 1
         self.last_save_time = current_time
 
-    def commit_data(self, base_dir: str, drive_type: str, drive_speed_base: int, control_mode: str) -> None:
-        final_img_dir = os.path.join(base_dir, "images")
+    def commit_data(
+        self,
+        base_dir: str,
+        drive_type: str,
+        drive_speed_base: int,
+        control_mode: str,
+        camera_id: str,
+        recording_duration_sec: float,
+    ) -> None:
+        final_img_dir = os.path.join(base_dir, "image")
         final_csv_path = os.path.join(base_dir, "driving_log.csv")
 
         os.makedirs(final_img_dir, exist_ok=True)
 
+        moved_count = 0
         for img_file in os.listdir(self.temp_img_dir):
             src = os.path.join(self.temp_img_dir, img_file)
             dst = os.path.join(final_img_dir, img_file)
             shutil.move(src, dst)
+            moved_count += 1
 
         file_exists = os.path.isfile(final_csv_path)
         with open(final_csv_path, mode="a", newline="") as f_out:
@@ -138,6 +178,8 @@ class DataRecorder:
                 reader = csv.reader(f_in)
                 next(reader)
                 for row in reader:
+                    if row and isinstance(row[0], str) and row[0].startswith("images/"):
+                        row[0] = row[0].replace("images/", "image/", 1)
                     if len(row) == 3:
                         row.append(drive_type)
                         row.append(drive_speed_base)
@@ -148,6 +190,14 @@ class DataRecorder:
                     elif len(row) == 5:
                         row.append(control_mode)
                     writer.writerow(row)
+
+        summary_path = os.path.join(base_dir, "recording_summary.txt")
+        with open(summary_path, mode="w", encoding="utf-8") as f:
+            f.write(f"image_count={moved_count}\n")
+            f.write(f"drive_type={drive_type}\n")
+            f.write(f"camera_id={camera_id}\n")
+            f.write(f"drive_speed_base={drive_speed_base}\n")
+            f.write(f"recording_duration_sec={recording_duration_sec:.3f}\n")
 
         shutil.rmtree(self.temp_dir)
 
