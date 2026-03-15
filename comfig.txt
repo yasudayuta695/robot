@@ -1,0 +1,22 @@
+# Config file for data collection
+# 各PCで、このプロジェクトフォルダのパスを save_base_dir に設定してください
+# Linux例: save_base_dir=/home/ryuryu/lab/Robot_car
+# UNC例: save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
+save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\
+
+# 速度基準（UI初期値）
+drive_speed_default=60
+# 十字キー速度の比率（drive_speed_defaultに対する倍率）
+dpad_drive_speed_scale=1.0
+dpad_turn_speed_scale=0.4
+
+# カメラ選択肢
+camera_id=camera_1
+camera_id=camera_2
+default_camera_id=camera_1
+
+# 走行種別は drive_type= で複数行書けます
+drive_type=straight
+drive_type=left_curve
+drive_type=right_curve
+drive_type=stop_and_go
