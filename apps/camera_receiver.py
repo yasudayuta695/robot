@@ -41,13 +41,16 @@ class CameraReceiver:
         #二値化
         _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
         #ノイズ除去
-        blur = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        blur = cv2.GaussianBlur(binary, (5, 5), 1.0)
+        #モルフォロジ処理
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(blur, cv2.MORPH_OPEN, kernel)
         #エッジ検出
-        edges = cv2.Canny(blur, 80, 150)
+        edges = cv2.Canny(binary, 80, 150)
         #ハフ返還
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=5)
+        #lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=5)
 
-        return lines
+        return edges
         
         
     def _run(self) -> None:
