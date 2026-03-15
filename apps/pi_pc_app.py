@@ -120,8 +120,11 @@ class UnifiedApp:
         self.csv_writer = None
         self.preview_images = []
         self.wsl_distro_name = os.environ.get("WSL_DISTRO_NAME", "Ubuntu-24.04")
-        self.script_path = os.path.abspath(__file__)
-        self.project_dir = os.path.dirname(self.script_path)
+        self.module_path = os.path.abspath(__file__)
+        self.module_dir = os.path.dirname(self.module_path)
+        self.project_dir = os.path.dirname(self.module_dir)
+        launcher_path = os.path.join(self.project_dir, "pi_pc_app.py")
+        self.script_path = launcher_path if os.path.exists(launcher_path) else self.module_path
         self.script_path_display = to_wsl_unc_path(self.script_path, self.wsl_distro_name)
         
         # 設定ファイルはプロジェクト配下の comfig.txt を使用

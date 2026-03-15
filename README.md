@@ -1,5 +1,10 @@
 # Robot_car
 
+## コード構成
+
+- 実運用のメインスクリプトは `apps/` フォルダに配置しています（`pi_pc_app.py`, `pi_main.py`）。
+- テスト/補助スクリプトは `test/` フォルダに配置しています（`pc_receiver.py`, `pi_mortor.py`, `pi_pc.py`, `pi_sender.py`）。
+
 ## pi_pc_app.py のデータ保存フロー
 
 - 録画停止時に「保存前プレビュー」ウィンドウが表示されます。
@@ -21,8 +26,8 @@
 ```txt
 save_base_dir=/home/ryuryu/lab/Robot_car
 drive_speed_default=60
-dpad_drive_speed_scale=0.8333
-dpad_turn_speed_scale=0.5
+dpad_drive_speed_scale=1.0
+dpad_turn_speed_scale=0.4
 camera_id=camera_1
 camera_id=camera_2
 default_camera_id=camera_1
