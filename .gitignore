@@ -1,0 +1,7 @@
+# Temporary dataset files
+*.jpg
+*.csv
+
+# Python cache files
+__pycache__/
+*.pyc
