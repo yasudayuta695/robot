@@ -1,6 +1,7 @@
 import logging
 import os
 import tkinter as tk
+import cv2
 from tkinter import ttk
 from typing import Dict, List, Set, Tuple
 
@@ -437,6 +438,7 @@ class UnifiedApp:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
                 cv2.line(frame, (x1, y1), (x2, y2), (51, 255, 105), 2)
+
         pil_image = Image.fromarray(frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
