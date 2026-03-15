@@ -35,6 +35,21 @@ class CameraReceiver:
         with self._lock:
             return self._image.copy()
 
+    def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
+        #グレースケール変換
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        #二値化
+        _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        #ノイズ除去
+        blur = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        #エッジ検出
+        edges = cv2.Canny(blur, 80, 150)
+        #ハフ返還
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=5)
+
+        return lines
+        
+        
     def _run(self) -> None:
         ctx = zmq.Context()
         cam_socket = ctx.socket(zmq.PULL)
@@ -48,7 +63,6 @@ class CameraReceiver:
                 except zmq.ZMQError:
                     time.sleep(0.01)
                     continue
-
                 try:
                     img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
                     img = cv2.resize(img, (640, 480))
