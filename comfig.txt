@@ -2,6 +2,7 @@
 # 各PCで、このプロジェクトフォルダのパスを save_base_dir に設定してください
 # Linux例: save_base_dir=/home/ryuryu/lab/Robot_car
 # UNC例: save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
+
 save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\
 
 # 速度基準（UI初期値）
