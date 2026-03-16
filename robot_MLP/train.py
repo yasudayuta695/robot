@@ -303,10 +303,7 @@ def train(args: argparse.Namespace) -> None:
 
     model_cpu = model.to("cpu").eval()
     dummy = torch.randn(1, input_dim, dtype=torch.float32)
-    torch.onnx.export(
-        model_cpu,
-        dummy,
-        args.onnx_path,
+    export_kwargs = dict(
         export_params=True,
         opset_version=13,
         do_constant_folding=True,
@@ -314,6 +311,24 @@ def train(args: argparse.Namespace) -> None:
         output_names=["motor_output"],
         dynamic_axes={"input": {0: "batch"}, "motor_output": {0: "batch"}},
     )
+    try:
+        # Prefer legacy exporter to avoid hard dependency on onnxscript.
+        torch.onnx.export(model_cpu, dummy, args.onnx_path, dynamo=False, **export_kwargs)
+    except TypeError:
+        # Older torch versions do not support `dynamo` argument.
+        torch.onnx.export(model_cpu, dummy, args.onnx_path, **export_kwargs)
+    except ModuleNotFoundError as exc:
+        if exc.name in ("onnx", "onnxscript"):
+            raise ModuleNotFoundError(
+                "ONNX export requires optional packages. Run: pip install onnx onnxscript"
+            ) from exc
+        raise
+    except torch.onnx.OnnxExporterError as exc:
+        if "onnx" in str(exc).lower():
+            raise ModuleNotFoundError(
+                "ONNX export requires optional packages. Run: pip install onnx onnxscript"
+            ) from exc
+        raise
     print(f"Exported ONNX model: {args.onnx_path}")
 
 

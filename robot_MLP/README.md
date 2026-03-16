@@ -43,11 +43,12 @@ cd /home/cr7_yas97/ss2025robot
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install torch numpy matplotlib
+pip install torch numpy matplotlib onnx onnxscript
 ```
 
 Notes:
 - `matplotlib` is optional (only for learning curve image).
+- `onnx` and `onnxscript` are required for ONNX export.
 - GPU is auto-used when available unless `--device cpu` is specified.
 
 ## 4. Train
