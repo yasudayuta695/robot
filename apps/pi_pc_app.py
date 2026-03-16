@@ -7,6 +7,7 @@ from typing import Dict, List, Set, Tuple
 
 from PIL import Image, ImageTk
 
+from ai_controller import LineTraceONNXController
 from camera_receiver import CameraReceiver
 from config_loader import AppConfig, ensure_config_file, load_config, migrate_legacy_config_if_needed
 from control_logic import DriveParams, compute_dpad_command, compute_joystick_command
@@ -33,6 +34,8 @@ OUTER_SPEED_SCALE = 1.05
 INNER_SPEED_SCALE = 0.9
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
+DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
+EMERGENCY_STOP_KEYS = {"space", "Escape"}
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -80,9 +83,18 @@ class UnifiedApp:
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
+        self.ai_controller = LineTraceONNXController(
+            history=10,
+            smoothing_alpha=0.55,
+            max_motor_speed=100,
+            stop_on_no_line=True,
+        )
+        self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
+        self._ai_error_logged = False
 
         self.current_l_speed = 0
         self.current_r_speed = 0
+        self.emergency_stop_active = False
         self.preview_images: List[ImageTk.PhotoImage] = []
         self.active_dirs: Set[str] = set()
         self.key_to_dir: Dict[str, str] = {
@@ -101,6 +113,9 @@ class UnifiedApp:
         }
 
         self._build_ui()
+        if os.path.isfile(self.ai_model_default_path):
+            self.ai_model_path_var.set(self.ai_model_default_path)
+            self.load_ai_model()
         self._log_paths()
         self.update_camera_frame()
 
@@ -302,6 +317,40 @@ class UnifiedApp:
             value="dpad",
             command=self.on_mode_change,
         ).pack(anchor="w")
+        tk.Radiobutton(
+            mode_frame,
+            text="AI (ONNX)",
+            variable=self.control_mode,
+            value="ai",
+            command=self.on_mode_change,
+        ).pack(anchor="w")
+        self.emergency_status_var = tk.StringVar(value="Emergency stop standby (hold Space/Esc)")
+        self.emergency_status_label = tk.Label(
+            mode_frame,
+            textvariable=self.emergency_status_var,
+            fg="firebrick",
+            anchor="w",
+        )
+        self.emergency_status_label.pack(fill=tk.X, pady=(4, 0))
+
+        self.ai_frame = tk.LabelFrame(self.joy_frame, text="AI Controller")
+        self.ai_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(self.ai_frame, text="ONNX:").grid(row=0, column=0, padx=(6, 4), pady=6, sticky="w")
+        self.ai_model_path_var = tk.StringVar(value=self.ai_model_default_path)
+        self.ai_model_path_entry = tk.Entry(self.ai_frame, textvariable=self.ai_model_path_var, width=36)
+        self.ai_model_path_entry.grid(row=0, column=1, padx=(0, 6), pady=6, sticky="we")
+
+        self.ai_load_btn = tk.Button(self.ai_frame, text="Load", command=self.load_ai_model)
+        self.ai_load_btn.grid(row=0, column=2, padx=(0, 6), pady=6)
+
+        self.ai_reset_btn = tk.Button(self.ai_frame, text="Reset", command=self.reset_ai_state)
+        self.ai_reset_btn.grid(row=0, column=3, padx=(0, 6), pady=6)
+
+        self.ai_status_var = tk.StringVar(value="AI model: not loaded")
+        self.ai_status_label = tk.Label(self.ai_frame, textvariable=self.ai_status_var, fg="gray30", anchor="w")
+        self.ai_status_label.grid(row=1, column=0, columnspan=4, padx=6, pady=(0, 6), sticky="we")
+        self.ai_frame.grid_columnconfigure(1, weight=1)
 
         self.canvas = tk.Canvas(self.joy_frame, width=CENTER * 2, height=CENTER * 2, bg="white")
         self.canvas.pack(pady=20)
@@ -495,6 +544,7 @@ class UnifiedApp:
     def on_mode_change(self) -> None:
         self.active_dirs.clear()
         self.send_command(0, 0)
+        self.reset_ai_state()
         self.canvas.coords(
             self.stick,
             CENTER - STICK_RADIUS,
@@ -505,11 +555,21 @@ class UnifiedApp:
         if self.control_mode.get() == "joystick":
             self.dpad_frame.pack_forget()
             self.canvas.pack(pady=20)
-        else:
+        elif self.control_mode.get() == "dpad":
             self.canvas.pack_forget()
             self.dpad_frame.pack(pady=20)
+        else:
+            self.canvas.pack_forget()
+            self.dpad_frame.pack_forget()
+            if not self.ai_controller.is_loaded():
+                self.load_ai_model()
 
     def on_key_press(self, event: tk.Event) -> None:
+        if event.keysym in EMERGENCY_STOP_KEYS:
+            self.set_emergency_stop(True)
+            self.send_command(0, 0)
+            return
+
         if self.control_mode.get() != "dpad":
             return
         direction = self.key_to_dir.get(event.keysym)
@@ -519,12 +579,28 @@ class UnifiedApp:
         self.apply_dpad_keys()
 
     def on_key_release(self, event: tk.Event) -> None:
+        if event.keysym in EMERGENCY_STOP_KEYS:
+            self.set_emergency_stop(False)
+            return
+
         direction = self.key_to_dir.get(event.keysym)
         if direction is None:
             return
         self.active_dirs.discard(direction)
         if self.control_mode.get() == "dpad":
             self.apply_dpad_keys()
+
+    def set_emergency_stop(self, active: bool) -> None:
+        if self.emergency_stop_active == active:
+            return
+
+        self.emergency_stop_active = active
+        if active:
+            self.emergency_status_var.set("EMERGENCY STOP ACTIVE (release Space/Esc to resume)")
+            self.logger.warning("Emergency stop activated")
+        else:
+            self.emergency_status_var.set("Emergency stop standby (hold Space/Esc)")
+            self.logger.info("Emergency stop released")
 
     def apply_dpad_keys(self) -> None:
         left_speed, right_speed = compute_dpad_command(
@@ -535,12 +611,60 @@ class UnifiedApp:
         )
         self.send_command(left_speed, right_speed)
 
+    def load_ai_model(self) -> None:
+        model_path = self.ai_model_path_var.get().strip()
+        if not model_path:
+            self.ai_status_var.set("AI model: path is empty")
+            return
+
+        if not os.path.isfile(model_path):
+            self.ai_status_var.set(f"AI model not found: {model_path}")
+            self.logger.warning("AI model not found: %s", model_path)
+            return
+
+        try:
+            self.ai_controller.load_model(model_path)
+            self.ai_status_var.set(f"AI model loaded: {model_path}")
+            self._ai_error_logged = False
+            self.logger.info("AI ONNX model loaded: %s", to_wsl_unc_path(model_path, self.wsl_distro_name))
+        except Exception as exc:
+            self.ai_status_var.set(f"AI load failed: {exc}")
+            self.logger.warning("AI model load failed: %s", exc)
+
+    def reset_ai_state(self) -> None:
+        self.ai_controller.reset_state()
+        self._ai_error_logged = False
+
+    def run_ai_control(self, line_features: Dict[str, float]) -> None:
+        if not self.ai_controller.is_loaded():
+            self.send_command(0, 0)
+            return
+
+        try:
+            left_speed, right_speed = self.ai_controller.predict_motor_speed(
+                line_features=line_features,
+                current_left_speed=self.current_l_speed,
+                current_right_speed=self.current_r_speed,
+                base_speed=self.get_drive_speed(),
+            )
+            self._ai_error_logged = False
+            self.send_command(left_speed, right_speed)
+        except Exception as exc:
+            if not self._ai_error_logged:
+                self.logger.warning("AI inference failed: %s", exc)
+                self._ai_error_logged = True
+            self.send_command(0, 0)
+
     def update_camera_frame(self) -> None:
         frame = self.camera_receiver.get_latest_frame()
 
         line_vis = self.camera_receiver.find_line(frame)
         display_src = line_vis if line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
+        line_features = self.camera_receiver.get_latest_line_features()
+
+        if self.control_mode.get() == "ai":
+            self.run_ai_control(line_features)
         
         pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
@@ -551,7 +675,7 @@ class UnifiedApp:
             image_rgb=frame,
             left_speed=self.current_l_speed,
             right_speed=self.current_r_speed,
-            line_features=self.camera_receiver.get_latest_line_features(),
+            line_features=line_features,
             drive_type=self.drive_type_var.get(),
             drive_speed_base=self.get_drive_speed(),
             control_mode=self.control_mode.get(),
@@ -561,6 +685,10 @@ class UnifiedApp:
         self.root.after(30, self.update_camera_frame)
 
     def send_command(self, left_speed: int, right_speed: int) -> None:
+        if self.emergency_stop_active:
+            left_speed = 0
+            right_speed = 0
+
         self.current_l_speed = left_speed
         self.current_r_speed = right_speed
 
@@ -572,6 +700,7 @@ class UnifiedApp:
         if (
             self.recorder.state == RecorderState.RECORDING
             and self.auto_stop_on_zero_var.get()
+            and not self.emergency_stop_active
             and left_speed == 0
             and right_speed == 0
         ):
