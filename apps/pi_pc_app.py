@@ -433,11 +433,10 @@ class UnifiedApp:
     def update_camera_frame(self) -> None:
         frame = self.camera_receiver.get_latest_frame()
 
-        edges = self.camera_receiver.find_line(frame)
-        if edges is None:
-            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        else:
-            display_frame = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        line_vis = self.camera_receiver.find_line(frame)
+        display_src = line_vis if line_vis is not None else frame
+        display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
+        
         pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
