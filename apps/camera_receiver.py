@@ -182,6 +182,13 @@ class CameraReceiver:
             self._set_latest_line_features(features)
             return vis
 
+        def max_segment_width_px(row_index: int) -> int:
+            t = float(row_index) / max(1.0, float(roi_h - 1))
+            base_ratio = 0.20 + (0.22 * t)
+            relax_ratio = min(0.10, 0.02 * float(self._consecutive_misses))
+            ratio = float(np.clip(base_ratio + relax_ratio, 0.18, 0.52))
+            return max(8, int(ratio * float(w)))
+
         def contour_score(cnt: np.ndarray) -> float:
             area = float(cv2.contourArea(cnt))
             if area <= 0.0:
@@ -189,6 +196,19 @@ class CameraReceiver:
             x, y, bw, bh = cv2.boundingRect(cnt)
             span_ratio = float(bh) / max(1.0, float(roi_h))
             if area < 180.0 or span_ratio < 0.10:
+                return -1.0
+
+            fill_ratio = area / max(1.0, float(bw * bh))
+            bw_ratio = float(bw) / max(1.0, float(w))
+            avg_row_width = area / max(1.0, float(bh))
+            mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
+
+            # 線ではなく塊になった暗領域を除外
+            if fill_ratio > 0.72 and (float(bh) / max(1.0, float(bw))) < 2.0:
+                return -1.0
+            if bw_ratio > 0.62 and fill_ratio > 0.35:
+                return -1.0
+            if avg_row_width > (mid_allowed_width * 1.25):
                 return -1.0
 
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
@@ -230,13 +250,14 @@ class CameraReceiver:
         seed_x = float(self._prev_center_x) if self._prev_center_x is not None else (w * 0.5)
         seed_x = float(np.clip(seed_x, 0.0, float(w - 1)))
 
-        def row_segments(row: np.ndarray) -> list[tuple[float, float, int, int]]:
+        def row_segments(row_index: int, row: np.ndarray) -> list[tuple[float, float, int, int]]:
             xs = np.flatnonzero(row > 0)
             if xs.size < 2:
                 return []
             split_idx = np.where(np.diff(xs) > 1)[0] + 1
             segments = np.split(xs, split_idx)
             result: list[tuple[float, float, int, int]] = []
+            max_seg_w = max_segment_width_px(row_index)
             for seg in segments:
                 if seg.size < 2:
                     continue
@@ -244,6 +265,8 @@ class CameraReceiver:
                 x_max = int(seg[-1])
                 seg_w = x_max - x_min
                 if seg_w <= 1:
+                    continue
+                if seg_w > max_seg_w:
                     continue
                 cx = 0.5 * (x_min + x_max)
                 result.append((float(cx), float(seg_w), x_min, x_max))
@@ -256,7 +279,7 @@ class CameraReceiver:
         best_seed = None
         best_seed_cost = float("inf")
         for r in range(seed_r0, seed_r1):
-            segs = row_segments(target_mask[r, :])
+            segs = row_segments(r, target_mask[r, :])
             for cx, seg_w, x_min, x_max in segs:
                 width_cost = max(0.0, seg_w - (0.35 * float(w))) * 0.35
                 border_penalty = 40.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
@@ -282,7 +305,7 @@ class CameraReceiver:
 
             end = roi_h if step > 0 else -1
             for r in range(start_row, end, step):
-                segs = row_segments(target_mask[r, :])
+                segs = row_segments(r, target_mask[r, :])
                 if not segs:
                     misses += 1
                     if misses > max_misses:
