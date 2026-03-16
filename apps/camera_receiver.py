@@ -78,22 +78,52 @@ class CameraReceiver:
         target_mask = np.zeros_like(mask)
         cv2.drawContours(target_mask, [target], -1, 255, thickness=cv2.FILLED)
 
-        # ライン方向に沿った緑線（fitLine）
-        vx, vy, x0, y0 = cv2.fitLine(target_shifted, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-        L = max(w, h)
-        p1 = (int(x0 - vx * L), int(y0 - vy * L))
-        p2 = (int(x0 + vx * L), int(y0 + vy * L))
-        cv2.line(vis, p1, p2, (0, 255, 0), 2)
-
-        # 全体幅（各行の x幅 の中央値）
+        # 黒ライン中心を各y行で求め、緑の折れ線として描画（曲線にも追従しやすい）
         ys_all, xs_all = np.where(target_mask > 0)
-        row_widths_all = []
-        for r in np.unique(ys_all):
+        row_indices = np.unique(ys_all)
+        row_centers = []
+        row_widths = []
+        for r in row_indices:
             row_xs = xs_all[ys_all == r]
             if row_xs.size >= 2:
-                row_widths_all.append(int(row_xs.max() - row_xs.min()))
-        if row_widths_all:
-            width_px = int(np.median(row_widths_all))
+                x_min = int(row_xs.min())
+                x_max = int(row_xs.max())
+                row_centers.append((x_min + x_max) / 2.0)
+                row_widths.append(x_max - x_min)
+            else:
+                row_centers.append(np.nan)
+                row_widths.append(0)
+
+        row_centers_np = np.array(row_centers, dtype=np.float32)
+        valid_mask = ~np.isnan(row_centers_np)
+        if np.count_nonzero(valid_mask) < 8:
+            return vis
+
+        valid_rows = row_indices[valid_mask]
+        valid_centers = row_centers_np[valid_mask]
+        valid_widths = np.array(row_widths, dtype=np.float32)[valid_mask]
+
+        # 近傍平均でx方向のガタつきを抑える
+        if valid_centers.size >= 7:
+            kernel_smooth = np.ones(7, dtype=np.float32) / 7.0
+            smooth_centers = np.convolve(valid_centers, kernel_smooth, mode="same")
+        else:
+            smooth_centers = valid_centers
+
+        centerline_points = np.stack(
+            [
+                np.clip(np.round(smooth_centers), 0, w - 1).astype(np.int32),
+                (valid_rows + roi_top).astype(np.int32),
+            ],
+            axis=1,
+        )
+        if centerline_points.shape[0] >= 2:
+            pts = centerline_points[::2].reshape(-1, 1, 2)
+            cv2.polylines(vis, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
+
+        # 全体幅（各行の幅の中央値）
+        if valid_widths.size > 0:
+            width_px = int(np.median(valid_widths))
             cv2.putText(
                 vis,
                 f"width={width_px}px",
@@ -120,23 +150,15 @@ class CameraReceiver:
             # 帯域中央の固定y（ROI座標）
             ay = int(np.clip(ay_global - roi_top, ry0, ry1 - 1))
 
-            # 固定y付近の細い帯で中心xと幅を計算
+            # 固定y付近の細い帯で、中心線xと幅を計算
             band_top = max(ry0, ay - 6)
             band_bot = min(ry1, ay + 7)
-            strip = target_mask[band_top:band_bot, :]
-
-            ys, xs = np.where(strip > 0)
-            if xs.size < 10:
+            band_mask = (valid_rows >= band_top) & (valid_rows < band_bot)
+            if np.count_nonzero(band_mask) < 2:
                 continue
 
-            px = int(np.median(xs))
-
-            widths = []
-            for rr in np.unique(ys):
-                row_xs = xs[ys == rr]
-                if row_xs.size >= 2:
-                    widths.append(int(row_xs.max() - row_xs.min()))
-            wz = int(np.median(widths)) if widths else 0
+            px = int(np.median(smooth_centers[band_mask]))
+            wz = int(np.median(valid_widths[band_mask]))
 
             py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
