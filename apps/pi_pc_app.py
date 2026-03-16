@@ -182,6 +182,42 @@ class UnifiedApp:
         )
         self.record_btn.pack(side=tk.LEFT)
 
+        far_threshold, near_threshold = self.camera_receiver.get_thresholds()
+        self.threshold_frame = tk.Frame(self.main_frame)
+        self.threshold_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+
+        tk.Label(self.threshold_frame, text="黒ライン閾値(遠):").pack(side=tk.LEFT)
+        self.far_threshold_var = tk.IntVar(value=far_threshold)
+        self.far_threshold_scale = tk.Scale(
+            self.threshold_frame,
+            from_=40,
+            to=180,
+            orient=tk.HORIZONTAL,
+            variable=self.far_threshold_var,
+            command=self.on_far_threshold_change,
+            showvalue=False,
+            length=140,
+        )
+        self.far_threshold_scale.pack(side=tk.LEFT)
+        self.far_threshold_value_label = tk.Label(self.threshold_frame, text=str(far_threshold), width=4)
+        self.far_threshold_value_label.pack(side=tk.LEFT, padx=(0, 16))
+
+        tk.Label(self.threshold_frame, text="黒ライン閾値(近):").pack(side=tk.LEFT)
+        self.near_threshold_var = tk.IntVar(value=near_threshold)
+        self.near_threshold_scale = tk.Scale(
+            self.threshold_frame,
+            from_=20,
+            to=160,
+            orient=tk.HORIZONTAL,
+            variable=self.near_threshold_var,
+            command=self.on_near_threshold_change,
+            showvalue=False,
+            length=140,
+        )
+        self.near_threshold_scale.pack(side=tk.LEFT)
+        self.near_threshold_value_label = tk.Label(self.threshold_frame, text=str(near_threshold), width=4)
+        self.near_threshold_value_label.pack(side=tk.LEFT)
+
         self.path_info_label = tk.Label(
             self.main_frame,
             text=(
@@ -256,6 +292,14 @@ class UnifiedApp:
 
     def on_drive_speed_change(self, _value: str) -> None:
         self.drive_speed_value_label.config(text=f"{self.get_drive_speed()}%")
+
+    def on_far_threshold_change(self, _value: str) -> None:
+        far, _ = self.camera_receiver.set_thresholds(far_threshold=int(self.far_threshold_var.get()))
+        self.far_threshold_value_label.config(text=str(far))
+
+    def on_near_threshold_change(self, _value: str) -> None:
+        _, near = self.camera_receiver.set_thresholds(near_threshold=int(self.near_threshold_var.get()))
+        self.near_threshold_value_label.config(text=str(near))
 
     def get_drive_speed(self) -> int:
         return max(0, min(100, int(self.drive_speed_var.get())))
