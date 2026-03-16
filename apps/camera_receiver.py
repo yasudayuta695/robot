@@ -39,19 +39,35 @@ class CameraReceiver:
         vis = img.copy()
         h, w = vis.shape[:2]
 
-        # 奥側も取りたい場合はこの値を小さくする（0.20 -> 0.10）
-        roi_top = int(h * 0.10)
+        # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
+        roi_top = int(h * 0.05)
         roi = vis[roi_top:, :]
 
-        # 黒抽出
+        # 黒抽出（遠方は細く低コントラストになりやすいので閾値を分ける）
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask = cv2.threshold(blur, 70, 255, cv2.THRESH_BINARY_INV)
+        roi_h = blur.shape[0]
+        far_split = int(roi_h * 0.45)
 
-        # ノイズ除去
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        _, mask_far = cv2.threshold(blur[:far_split, :], 95, 255, cv2.THRESH_BINARY_INV)
+        _, mask_near = cv2.threshold(blur[far_split:, :], 70, 255, cv2.THRESH_BINARY_INV)
+
+        mask = np.zeros_like(blur, dtype=np.uint8)
+        mask[:far_split, :] = mask_far
+        mask[far_split:, :] = mask_near
+
+        # 遠方は細線を残すため弱め、手前はノイズ除去を強めに処理
+        kernel_far = np.ones((3, 3), np.uint8)
+        kernel_near = np.ones((5, 5), np.uint8)
+        far_region = cv2.morphologyEx(mask[:far_split, :], cv2.MORPH_OPEN, kernel_far)
+        far_region = cv2.morphologyEx(far_region, cv2.MORPH_CLOSE, kernel_far)
+        near_region = cv2.morphologyEx(mask[far_split:, :], cv2.MORPH_OPEN, kernel_near)
+        near_region = cv2.morphologyEx(near_region, cv2.MORPH_CLOSE, kernel_near)
+        mask[:far_split, :] = far_region
+        mask[far_split:, :] = near_region
+
+        # 上下の切れ目をつなげる
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8))
 
         # 3分割ガイド（遠/中/近）
         y1 = h // 3
@@ -66,8 +82,17 @@ class CameraReceiver:
         if not contours:
             return vis
 
-        target = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(target) <= 300:
+        def contour_score(cnt: np.ndarray) -> float:
+            area = float(cv2.contourArea(cnt))
+            if area <= 0.0:
+                return -1.0
+            _, y, _, _ = cv2.boundingRect(cnt)
+            # ROI上側まで伸びる輪郭をやや優先する
+            far_bonus = 1.0 + 0.45 * (1.0 - (float(y) / max(1.0, float(roi_h))))
+            return area * far_bonus
+
+        target = max(contours, key=contour_score)
+        if cv2.contourArea(target) <= 220:
             return vis
 
         # 描画用にグローバル座標へ戻す
@@ -99,31 +124,74 @@ class CameraReceiver:
         if np.count_nonzero(valid_mask) < 8:
             return vis
 
-        valid_rows = row_indices[valid_mask]
-        valid_centers = row_centers_np[valid_mask]
+        valid_rows = row_indices[valid_mask].astype(np.int32)
+        valid_centers = row_centers_np[valid_mask].astype(np.float32)
         valid_widths = np.array(row_widths, dtype=np.float32)[valid_mask]
 
-        # 近傍平均でx方向のガタつきを抑える
-        if valid_centers.size >= 7:
-            kernel_smooth = np.ones(7, dtype=np.float32) / 7.0
-            smooth_centers = np.convolve(valid_centers, kernel_smooth, mode="same")
-        else:
-            smooth_centers = valid_centers
+        # 端で細くなる部分は中心が暴れやすいので、極端に細い行を除外
+        median_width = float(np.median(valid_widths))
+        min_stable_width = max(2.0, median_width * 0.25)
+        stable_mask = valid_widths >= min_stable_width
+        if np.count_nonzero(stable_mask) >= 8:
+            valid_rows = valid_rows[stable_mask]
+            valid_centers = valid_centers[stable_mask]
+            valid_widths = valid_widths[stable_mask]
+
+        # 検出できた範囲をROI全体へ補間して、途中で線が切れないようにする
+        roi_h = target_mask.shape[0]
+        dense_rows = np.arange(roi_h, dtype=np.int32)
+        interp_centers = np.interp(
+            dense_rows,
+            valid_rows,
+            valid_centers,
+            left=float(valid_centers[0]),
+            right=float(valid_centers[-1]),
+        ).astype(np.float32)
+        interp_widths = np.interp(
+            dense_rows,
+            valid_rows,
+            valid_widths,
+            left=float(valid_widths[0]),
+            right=float(valid_widths[-1]),
+        ).astype(np.float32)
+
+        # edge padして平滑化し、奥/手前端のくねりを抑える
+        smooth_window = 15 if roi_h >= 15 else max(3, (roi_h // 2) * 2 + 1)
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+        kernel_smooth = np.ones(smooth_window, dtype=np.float32) / float(smooth_window)
+        pad = smooth_window // 2
+        padded = np.pad(interp_centers, (pad, pad), mode="edge")
+        smooth_centers = np.convolve(padded, kernel_smooth, mode="valid")
 
         centerline_points = np.stack(
             [
                 np.clip(np.round(smooth_centers), 0, w - 1).astype(np.int32),
-                (valid_rows + roi_top).astype(np.int32),
+                (dense_rows + roi_top).astype(np.int32),
             ],
             axis=1,
         )
         if centerline_points.shape[0] >= 2:
-            pts = centerline_points[::2].reshape(-1, 1, 2)
-            cv2.polylines(vis, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
+            pts_xy = np.ascontiguousarray(centerline_points[::2], dtype=np.int32)
+            if pts_xy.shape[0] >= 2:
+                try:
+                    cv2.polylines(
+                        vis,
+                        [pts_xy.reshape(-1, 1, 2)],
+                        isClosed=False,
+                        color=(0, 255, 0),
+                        thickness=2,
+                    )
+                except cv2.error:
+                    # OpenCV build差異でpolylinesが失敗する場合のフォールバック
+                    for i in range(1, pts_xy.shape[0]):
+                        p_prev = tuple(pts_xy[i - 1])
+                        p_curr = tuple(pts_xy[i])
+                        cv2.line(vis, p_prev, p_curr, (0, 255, 0), 2)
 
         # 全体幅（各行の幅の中央値）
-        if valid_widths.size > 0:
-            width_px = int(np.median(valid_widths))
+        if interp_widths.size > 0:
+            width_px = int(np.median(interp_widths))
             cv2.putText(
                 vis,
                 f"width={width_px}px",
@@ -150,15 +218,9 @@ class CameraReceiver:
             # 帯域中央の固定y（ROI座標）
             ay = int(np.clip(ay_global - roi_top, ry0, ry1 - 1))
 
-            # 固定y付近の細い帯で、中心線xと幅を計算
-            band_top = max(ry0, ay - 6)
-            band_bot = min(ry1, ay + 7)
-            band_mask = (valid_rows >= band_top) & (valid_rows < band_bot)
-            if np.count_nonzero(band_mask) < 2:
-                continue
-
-            px = int(np.median(smooth_centers[band_mask]))
-            wz = int(np.median(valid_widths[band_mask]))
+            # 3点は描画中の中心線そのものから取得する
+            px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
+            wz = int(max(0.0, interp_widths[ay]))
 
             py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
