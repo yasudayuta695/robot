@@ -180,6 +180,8 @@ Steps:
 
 ```bash
 python /home/cr7_yas97/ss2025robot/apps/pi_pc_app.py
+
+python \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\apps\pi_pc_app.py
 ```
 
 
