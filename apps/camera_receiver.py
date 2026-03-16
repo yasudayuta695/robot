@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -16,6 +16,8 @@ class CameraReceiver:
         self._lock = threading.Lock()
         self._image = np.zeros((480, 640, 3), dtype=np.uint8)
         self._latest_line_features = self._default_line_features()
+        self._far_threshold = 100
+        self._near_threshold = 70
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -36,6 +38,18 @@ class CameraReceiver:
     def get_latest_line_features(self) -> Dict[str, float]:
         with self._lock:
             return self._latest_line_features.copy()
+
+    def get_thresholds(self) -> Tuple[int, int]:
+        with self._lock:
+            return self._far_threshold, self._near_threshold
+
+    def set_thresholds(self, far_threshold: Optional[int] = None, near_threshold: Optional[int] = None) -> Tuple[int, int]:
+        with self._lock:
+            if far_threshold is not None:
+                self._far_threshold = int(np.clip(int(far_threshold), 0, 255))
+            if near_threshold is not None:
+                self._near_threshold = int(np.clip(int(near_threshold), 0, 255))
+            return self._far_threshold, self._near_threshold
 
     def start(self) -> None:
         if self._running:
@@ -69,8 +83,10 @@ class CameraReceiver:
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
-        _, mask_far = cv2.threshold(blur[:far_split, :], 100, 255, cv2.THRESH_BINARY_INV)
-        _, mask_near = cv2.threshold(blur[far_split:, :], 70, 255, cv2.THRESH_BINARY_INV)
+        far_threshold, near_threshold = self.get_thresholds()
+
+        _, mask_far = cv2.threshold(blur[:far_split, :], far_threshold, 255, cv2.THRESH_BINARY_INV)
+        _, mask_near = cv2.threshold(blur[far_split:, :], near_threshold, 255, cv2.THRESH_BINARY_INV)
 
         mask = np.zeros_like(blur, dtype=np.uint8)
         mask[:far_split, :] = mask_far
@@ -97,6 +113,16 @@ class CameraReceiver:
         cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
         cv2.putText(vis, "Mid", (8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
         cv2.putText(vis, "Near", (8, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            f"th_far={far_threshold} th_near={near_threshold}",
+            (10, h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
