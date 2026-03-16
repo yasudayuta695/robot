@@ -2,6 +2,14 @@ import os
 
 
 def to_wsl_unc_path(path: str, distro_name: str = "Ubuntu-24.04") -> str:
+    if not path:
+        return path
+
+    # Avoid double conversion when the input is already a UNC path.
+    unc_prefix = "\\\\wsl.localhost\\"
+    if path.lower().startswith(unc_prefix):
+        return os.path.normpath(path)
+
     abs_path = os.path.abspath(path)
     linux_like = abs_path.replace("\\", "/")
     if linux_like.startswith("/"):

@@ -434,7 +434,10 @@ class UnifiedApp:
         frame = self.camera_receiver.get_latest_frame()
 
         edges = self.camera_receiver.find_line(frame)
-        display_frame = cv2.addWeighted(edges, cv2.COLOR_GRAY2RGB)
+        if edges is None:
+            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            display_frame = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
         pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
