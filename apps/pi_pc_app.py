@@ -433,13 +433,9 @@ class UnifiedApp:
     def update_camera_frame(self) -> None:
         frame = self.camera_receiver.get_latest_frame()
 
-        lines = self.camera_receiver.find_line(frame)
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                cv2.line(frame, (x1, y1), (x2, y2), (51, 255, 105), 2)
-
-        pil_image = Image.fromarray(frame)
+        edges = self.camera_receiver.find_line(frame)
+        display_frame = cv2.addWeighted(edges, cv2.COLOR_GRAY2RGB)
+        pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
         self.camera_label.image = tk_image
