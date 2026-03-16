@@ -18,8 +18,23 @@ class CameraReceiver:
         self._latest_line_features = self._default_line_features()
         self._far_threshold = 100
         self._near_threshold = 70
+        self._prev_center_x: Optional[float] = None
+        self._consecutive_misses = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def _on_detection_lost(self) -> None:
+        self._consecutive_misses += 1
+        if self._consecutive_misses > 8:
+            self._prev_center_x = None
+
+    def _on_detection_success(self, center_x: float) -> None:
+        if self._prev_center_x is None:
+            self._prev_center_x = float(center_x)
+        else:
+            # 急なジャンプを抑えるため、検出中心を緩やかに追従
+            self._prev_center_x = 0.7 * float(self._prev_center_x) + 0.3 * float(center_x)
+        self._consecutive_misses = 0
 
     def _default_line_features(self) -> Dict[str, float]:
         return {
@@ -77,9 +92,12 @@ class CameraReceiver:
         roi_top = int(h * 0.03)
         roi = vis[roi_top:, :]
 
-        # 黒抽出（遠方は細く低コントラストになりやすいので閾値を分ける）
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # 照明ムラ対策: LチャネルにCLAHEをかけて局所コントラストを補正
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        l_chan = lab[:, :, 0]
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        norm_l = clahe.apply(l_chan)
+        blur = cv2.GaussianBlur(norm_l, (5, 5), 0)
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
@@ -88,9 +106,37 @@ class CameraReceiver:
         _, mask_far = cv2.threshold(blur[:far_split, :], far_threshold, 255, cv2.THRESH_BINARY_INV)
         _, mask_near = cv2.threshold(blur[far_split:, :], near_threshold, 255, cv2.THRESH_BINARY_INV)
 
-        mask = np.zeros_like(blur, dtype=np.uint8)
-        mask[:far_split, :] = mask_far
-        mask[far_split:, :] = mask_near
+        global_mask = np.zeros_like(blur, dtype=np.uint8)
+        global_mask[:far_split, :] = mask_far
+        global_mask[far_split:, :] = mask_near
+
+        adaptive_mask = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            8,
+        )
+
+        # 局所適応閾値を足して、白飛び下で弱くなった黒線を拾いやすくする
+        mask = cv2.bitwise_or(global_mask, adaptive_mask)
+
+        # 白飛び由来の擬似エッジを抑制
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        glare_mask = cv2.inRange(hsv, (0, 0, 235), (180, 45, 255))
+        glare_mask = cv2.dilate(glare_mask, np.ones((5, 5), np.uint8), iterations=1)
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare_mask))
+
+        # 前フレーム中心を使った横方向の探索帯で黒ノイズ誤検出を抑える
+        center_hint = int(self._prev_center_x) if self._prev_center_x is not None else (w // 2)
+        corridor_half = int(w * (0.35 if self._prev_center_x is not None else 0.45))
+        x1 = max(0, center_hint - corridor_half)
+        x2 = min(w, center_hint + corridor_half)
+        if x2 > x1:
+            corridor_mask = np.zeros_like(mask, dtype=np.uint8)
+            corridor_mask[:, x1:x2] = 255
+            mask = cv2.bitwise_and(mask, corridor_mask)
 
         # 遠方は細線を残すため弱め、手前はノイズ除去を強めに処理
         kernel_far = np.ones((3, 3), np.uint8)
@@ -102,7 +148,8 @@ class CameraReceiver:
         mask[:far_split, :] = far_region
         mask[far_split:, :] = near_region
 
-        # 上下の切れ目をつなげる
+        # 白飛びで欠けた縦方向の途切れを埋める
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8))
 
         # 3分割ガイド（遠/中/近）
@@ -126,6 +173,7 @@ class CameraReceiver:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
 
@@ -133,13 +181,33 @@ class CameraReceiver:
             area = float(cv2.contourArea(cnt))
             if area <= 0.0:
                 return -1.0
-            _, y, _, _ = cv2.boundingRect(cnt)
-            # ROI上側まで伸びる輪郭をやや優先する
-            far_bonus = 1.0 + 0.45 * (1.0 - (float(y) / max(1.0, float(roi_h))))
-            return area * far_bonus
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            span_ratio = float(bh) / max(1.0, float(roi_h))
+            if area < 180.0 or span_ratio < 0.10:
+                return -1.0
 
-        target = max(contours, key=contour_score)
-        if cv2.contourArea(target) <= 220:
+            bottom_reach = float(y + bh) / max(1.0, float(roi_h))
+            aspect = float(bh) / max(1.0, float(bw))
+            cx = float(x) + float(bw) * 0.5
+
+            center_ref = self._prev_center_x if self._prev_center_x is not None else (w * 0.5)
+            dist_center = abs(cx - float(center_ref)) / max(1.0, (w * 0.5))
+            center_bonus = max(0.45, 1.0 - 0.55 * dist_center)
+
+            span_bonus = 0.7 + 1.2 * min(span_ratio, 1.0)
+            bottom_bonus = 0.7 + 0.6 * min(bottom_reach, 1.0)
+            shape_bonus = 0.75 + 0.35 * min(aspect / 3.0, 1.0)
+
+            # 横に広すぎる黒塊は誤検出しやすいので軽く減点
+            width_ratio = float(bw) / max(1.0, float(w))
+            blob_penalty = 0.65 if width_ratio > 0.82 and span_ratio < 0.55 else 1.0
+
+            return area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty
+
+        scored_contours = [(contour_score(cnt), cnt) for cnt in contours]
+        best_score, target = max(scored_contours, key=lambda item: item[0])
+        if best_score <= 0.0 or cv2.contourArea(target) <= 220:
+            self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
 
@@ -170,6 +238,7 @@ class CameraReceiver:
         row_centers_np = np.array(row_centers, dtype=np.float32)
         valid_mask = ~np.isnan(row_centers_np)
         if np.count_nonzero(valid_mask) < 8:
+            self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
 
@@ -251,6 +320,10 @@ class CameraReceiver:
                 2,
                 cv2.LINE_AA,
             )
+
+            # 追跡中心を更新
+            track_row = int(np.clip(roi_h * 0.80, 0, roi_h - 1))
+            self._on_detection_success(float(smooth_centers[track_row]))
 
         # 遠/中/近 3点（固定深度位置で算出）
         zones = [
