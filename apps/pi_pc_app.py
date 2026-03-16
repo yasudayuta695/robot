@@ -446,6 +446,7 @@ class UnifiedApp:
             image_rgb=frame,
             left_speed=self.current_l_speed,
             right_speed=self.current_r_speed,
+            line_features=self.camera_receiver.get_latest_line_features(),
             drive_type=self.drive_type_var.get(),
             drive_speed_base=self.get_drive_speed(),
             control_mode=self.control_mode.get(),

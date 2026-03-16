@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 from enum import Enum
-from typing import List
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -18,6 +18,26 @@ class RecorderState(str, Enum):
 
 
 class DataRecorder:
+    CSV_HEADER = [
+        "image_path",
+        "left_speed",
+        "right_speed",
+        "drive_type",
+        "drive_speed_base",
+        "control_mode",
+        "line_detect_top",
+        "line_detect_mid",
+        "line_detect_bottom",
+        "line_offset_top",
+        "line_offset_mid",
+        "line_offset_bottom",
+        "current_left_norm",
+        "current_right_norm",
+        "base_speed_norm",
+        "target_left_norm",
+        "target_right_norm",
+    ]
+
     def __init__(self, save_base_dir: str, logger: logging.Logger) -> None:
         self.logger = logger
         self.save_base_dir = save_base_dir
@@ -33,6 +53,8 @@ class DataRecorder:
         self.output_folder_name = ""
         self.recording_started_at = None
         self.recording_stopped_at = None
+        self.last_target_left_norm = 0.0
+        self.last_target_right_norm = 0.0
 
     def arm(self) -> None:
         if os.path.exists(self.temp_dir):
@@ -41,14 +63,7 @@ class DataRecorder:
 
         self.csv_file = open(self.temp_csv_path, mode="w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow([
-            "image_path",
-            "left_speed",
-            "right_speed",
-            "drive_type",
-            "drive_speed_base",
-            "control_mode",
-        ])
+        self.csv_writer.writerow(self.CSV_HEADER)
 
         self.state = RecorderState.ARMED
         self.last_save_time = 0.0
@@ -57,6 +72,8 @@ class DataRecorder:
         self.output_folder_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.recording_started_at = None
         self.recording_stopped_at = None
+        self.last_target_left_norm = 0.0
+        self.last_target_right_norm = 0.0
 
     def start_recording_if_needed(self, left_speed: int, right_speed: int) -> bool:
         if self.state == RecorderState.ARMED and (left_speed != 0 or right_speed != 0):
@@ -108,6 +125,7 @@ class DataRecorder:
         image_rgb: np.ndarray,
         left_speed: int,
         right_speed: int,
+        line_features: Dict[str, float],
         drive_type: str,
         drive_speed_base: int,
         control_mode: str,
@@ -129,6 +147,19 @@ class DataRecorder:
         bgr_img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(filepath, bgr_img)
 
+        target_left_norm = float(np.clip(left_speed / 100.0, -1.0, 1.0))
+        target_right_norm = float(np.clip(right_speed / 100.0, -1.0, 1.0))
+        current_left_norm = float(self.last_target_left_norm)
+        current_right_norm = float(self.last_target_right_norm)
+        base_speed_norm = float(np.clip(drive_speed_base / 100.0, 0.0, 1.0))
+
+        line_detect_top = float(line_features.get("line_detect_top", 0.0))
+        line_detect_mid = float(line_features.get("line_detect_mid", 0.0))
+        line_detect_bottom = float(line_features.get("line_detect_bottom", 0.0))
+        line_offset_top = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
+        line_offset_mid = float(np.clip(line_features.get("line_offset_mid", 0.0), -1.0, 1.0))
+        line_offset_bottom = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
+
         self.csv_writer.writerow([
             f"image/{filename}",
             left_speed,
@@ -136,9 +167,22 @@ class DataRecorder:
             drive_type,
             drive_speed_base,
             control_mode,
+            line_detect_top,
+            line_detect_mid,
+            line_detect_bottom,
+            line_offset_top,
+            line_offset_mid,
+            line_offset_bottom,
+            current_left_norm,
+            current_right_norm,
+            base_speed_norm,
+            target_left_norm,
+            target_right_norm,
         ])
         self.frame_sequence += 1
         self.last_save_time = current_time
+        self.last_target_left_norm = target_left_norm
+        self.last_target_right_norm = target_right_norm
 
     def commit_data(
         self,
@@ -165,14 +209,7 @@ class DataRecorder:
         with open(final_csv_path, mode="a", newline="") as f_out:
             writer = csv.writer(f_out)
             if not file_exists:
-                writer.writerow([
-                    "image_path",
-                    "left_speed",
-                    "right_speed",
-                    "drive_type",
-                    "drive_speed_base",
-                    "control_mode",
-                ])
+                writer.writerow(self.CSV_HEADER)
 
             with open(self.temp_csv_path, mode="r", newline="") as f_in:
                 reader = csv.reader(f_in)

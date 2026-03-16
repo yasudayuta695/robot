@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import cv2
@@ -15,8 +15,27 @@ class CameraReceiver:
         self.camera_port = camera_port
         self._lock = threading.Lock()
         self._image = np.zeros((480, 640, 3), dtype=np.uint8)
+        self._latest_line_features = self._default_line_features()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def _default_line_features(self) -> Dict[str, float]:
+        return {
+            "line_detect_top": 0.0,
+            "line_detect_mid": 0.0,
+            "line_detect_bottom": 0.0,
+            "line_offset_top": 0.0,
+            "line_offset_mid": 0.0,
+            "line_offset_bottom": 0.0,
+        }
+
+    def _set_latest_line_features(self, features: Dict[str, float]) -> None:
+        with self._lock:
+            self._latest_line_features = features.copy()
+
+    def get_latest_line_features(self) -> Dict[str, float]:
+        with self._lock:
+            return self._latest_line_features.copy()
 
     def start(self) -> None:
         if self._running:
@@ -38,6 +57,7 @@ class CameraReceiver:
     def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
         vis = img.copy()
         h, w = vis.shape[:2]
+        features = self._default_line_features()
 
         # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
         roi_top = int(h * 0.03)
@@ -80,6 +100,7 @@ class CameraReceiver:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            self._set_latest_line_features(features)
             return vis
 
         def contour_score(cnt: np.ndarray) -> float:
@@ -93,6 +114,7 @@ class CameraReceiver:
 
         target = max(contours, key=contour_score)
         if cv2.contourArea(target) <= 220:
+            self._set_latest_line_features(features)
             return vis
 
         # 描画用にグローバル座標へ戻す
@@ -122,6 +144,7 @@ class CameraReceiver:
         row_centers_np = np.array(row_centers, dtype=np.float32)
         valid_mask = ~np.isnan(row_centers_np)
         if np.count_nonzero(valid_mask) < 8:
+            self._set_latest_line_features(features)
             return vis
 
         valid_rows = row_indices[valid_mask].astype(np.int32)
@@ -205,11 +228,11 @@ class CameraReceiver:
 
         # 遠/中/近 3点（固定深度位置で算出）
         zones = [
-            ("Far", 0, y1, y1 // 2),
-            ("Mid", y1, y2, (y1 + y2) // 2),
-            ("Near", y2, h, (y2 + h) // 2),
+            ("Far", "top", 0, y1, y1 // 2),
+            ("Mid", "mid", y1, y2, (y1 + y2) // 2),
+            ("Near", "bottom", y2, h, (y2 + h) // 2),
         ]
-        for name, z0, z1, ay_global in zones:
+        for name, zone_key, z0, z1, ay_global in zones:
             ry0 = max(0, z0 - roi_top)
             ry1 = min(target_mask.shape[0], z1 - roi_top)
             if ry1 <= ry0:
@@ -221,6 +244,11 @@ class CameraReceiver:
             # 3点は描画中の中心線そのものから取得する
             px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
             wz = int(max(0.0, interp_widths[ay]))
+
+            # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離）
+            offset_norm = float((px - (w / 2.0)) / max(w / 2.0, 1.0))
+            features[f"line_detect_{zone_key}"] = 1.0
+            features[f"line_offset_{zone_key}"] = float(np.clip(offset_norm, -1.0, 1.0))
 
             py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
@@ -235,6 +263,7 @@ class CameraReceiver:
                 cv2.LINE_AA,
             )
 
+        self._set_latest_line_features(features)
         return vis
 
     def _run(self) -> None:
