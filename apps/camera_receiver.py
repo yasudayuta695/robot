@@ -40,7 +40,7 @@ class CameraReceiver:
         h, w = vis.shape[:2]
 
         # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
-        roi_top = int(h * 0.05)
+        roi_top = int(h * 0.03)
         roi = vis[roi_top:, :]
 
         # 黒抽出（遠方は細く低コントラストになりやすいので閾値を分ける）
@@ -49,7 +49,7 @@ class CameraReceiver:
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
-        _, mask_far = cv2.threshold(blur[:far_split, :], 95, 255, cv2.THRESH_BINARY_INV)
+        _, mask_far = cv2.threshold(blur[:far_split, :], 100, 255, cv2.THRESH_BINARY_INV)
         _, mask_near = cv2.threshold(blur[far_split:, :], 70, 255, cv2.THRESH_BINARY_INV)
 
         mask = np.zeros_like(blur, dtype=np.uint8)
