@@ -95,7 +95,7 @@ class CameraReceiver:
         # 照明ムラ対策: LチャネルにCLAHEをかけて局所コントラストを補正
         lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
         l_chan = lab[:, :, 0]
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
         norm_l = clahe.apply(l_chan)
         blur = cv2.GaussianBlur(norm_l, (5, 5), 0)
         roi_h = blur.shape[0]
@@ -110,32 +110,37 @@ class CameraReceiver:
         global_mask[:far_split, :] = mask_far
         global_mask[far_split:, :] = mask_near
 
-        adaptive_mask = cv2.adaptiveThreshold(
-            blur,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            8,
-        )
+        mask = global_mask.copy()
 
-        # 局所適応閾値を足して、白飛び下で弱くなった黒線を拾いやすくする
-        mask = cv2.bitwise_or(global_mask, adaptive_mask)
-
-        # 白飛び由来の擬似エッジを抑制
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        glare_mask = cv2.inRange(hsv, (0, 0, 235), (180, 45, 255))
-        glare_mask = cv2.dilate(glare_mask, np.ones((5, 5), np.uint8), iterations=1)
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare_mask))
-
-        # 前フレーム中心を使った横方向の探索帯で黒ノイズ誤検出を抑える
-        center_hint = int(self._prev_center_x) if self._prev_center_x is not None else (w // 2)
-        corridor_half = int(w * (0.15 if self._prev_center_x is not None else 0.20))
-        x1 = max(0, center_hint - corridor_half)
-        x2 = min(w, center_hint + corridor_half)
-        if x2 > x1:
+        # 前回中心がある場合のみ探索帯で絞る。上側は広く、下側は狭くして誤検出を抑える。
+        if self._prev_center_x is not None:
+            center_hint = float(np.clip(self._prev_center_x, 0.0, float(w - 1)))
+            relax_ratio = min(0.18, 0.03 * float(self._consecutive_misses))
             corridor_mask = np.zeros_like(mask, dtype=np.uint8)
-            corridor_mask[:, x1:x2] = 255
+            upper_safe_limit = int(roi_h * 0.78)
+
+            for r in range(roi_h):
+                t = float(r) / max(1.0, float(roi_h - 1))
+
+                # メイン探索帯: 遠方(上)は広く、近傍(下)は狭く
+                main_half_ratio = (0.48 * (1.0 - t)) + (0.18 * t) + relax_ratio
+                main_half_ratio = float(np.clip(main_half_ratio, 0.12, 0.60))
+                main_half = int(main_half_ratio * float(w))
+                x1_main = max(0, int(center_hint) - main_half)
+                x2_main = min(w, int(center_hint) + main_half)
+                if x2_main > x1_main:
+                    corridor_mask[r, x1_main:x2_main] = 255
+
+                # 上側は中央寄りの安全帯も残し、大きなカーブでの取りこぼしを抑える
+                if r < upper_safe_limit:
+                    safe_half_ratio = (0.52 * (1.0 - t)) + (0.24 * t)
+                    safe_half_ratio = float(np.clip(safe_half_ratio, 0.20, 0.58))
+                    safe_half = int(safe_half_ratio * float(w))
+                    x1_safe = max(0, (w // 2) - safe_half)
+                    x2_safe = min(w, (w // 2) + safe_half)
+                    if x2_safe > x1_safe:
+                        corridor_mask[r, x1_safe:x2_safe] = 255
+
             mask = cv2.bitwise_and(mask, corridor_mask)
 
         # 遠方は細線を残すため弱め、手前はノイズ除去を強めに処理
@@ -244,9 +249,9 @@ class CameraReceiver:
                 result.append((float(cx), float(seg_w), x_min, x_max))
             return result
 
-        seed_center_row = int(np.clip(roi_h * 0.62, 0, roi_h - 1))
-        seed_r0 = max(0, seed_center_row - 12)
-        seed_r1 = min(roi_h, seed_center_row + 13)
+        seed_center_row = int(np.clip(roi_h * 0.55, 0, roi_h - 1))
+        seed_r0 = max(0, seed_center_row - 18)
+        seed_r1 = min(roi_h, seed_center_row + 19)
 
         best_seed = None
         best_seed_cost = float("inf")
@@ -354,6 +359,11 @@ class CameraReceiver:
             valid_centers = valid_centers[stable_mask]
             valid_widths = valid_widths[stable_mask]
 
+        if valid_rows.size < 8:
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
         # 検出できた範囲をROI全体へ補間して、途中で線が切れないようにする
         roi_h = target_mask.shape[0]
         dense_rows = np.arange(roi_h, dtype=np.int32)
@@ -381,10 +391,15 @@ class CameraReceiver:
         padded = np.pad(interp_centers, (pad, pad), mode="edge")
         smooth_centers = np.convolve(padded, kernel_smooth, mode="valid")
 
+        valid_row_min = int(valid_rows.min())
+        valid_row_max = int(valid_rows.max())
+        valid_range_mask = (dense_rows >= valid_row_min) & (dense_rows <= valid_row_max)
+        draw_rows = dense_rows[valid_range_mask]
+
         centerline_points = np.stack(
             [
-                np.clip(np.round(smooth_centers), 0, w - 1).astype(np.int32),
-                (dense_rows + roi_top).astype(np.int32),
+                np.clip(np.round(smooth_centers[draw_rows]), 0, w - 1).astype(np.int32),
+                (draw_rows + roi_top).astype(np.int32),
             ],
             axis=1,
         )
@@ -407,8 +422,8 @@ class CameraReceiver:
                         cv2.line(vis, p_prev, p_curr, (0, 255, 0), 2)
 
         # 全体幅（各行の幅の中央値）
-        if interp_widths.size > 0:
-            width_px = int(np.median(interp_widths))
+        if draw_rows.size > 0:
+            width_px = int(np.median(interp_widths[draw_rows]))
             cv2.putText(
                 vis,
                 f"width={width_px}px",
@@ -420,8 +435,8 @@ class CameraReceiver:
                 cv2.LINE_AA,
             )
 
-            # 追跡中心を更新
-            track_row = int(np.clip(roi_h * 0.80, 0, roi_h - 1))
+            # 追跡中心を更新（下端ノイズに引っ張られすぎないよう少し上を採用）
+            track_row = int(np.clip(roi_h * 0.65, valid_row_min, valid_row_max))
             self._on_detection_success(float(smooth_centers[track_row]))
 
         # 遠/中/近 3点（固定深度位置で算出）
@@ -438,6 +453,10 @@ class CameraReceiver:
 
             # 帯域中央の固定y（ROI座標）
             ay = int(np.clip(ay_global - roi_top, ry0, ry1 - 1))
+
+            # valid_rows範囲外は見失い扱い（featuresは0.0のまま）
+            if ay < valid_row_min or ay > valid_row_max:
+                continue
 
             # 3点は描画中の中心線そのものから取得する
             px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
@@ -479,6 +498,7 @@ class CameraReceiver:
                     continue
                 try:
                     img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     img = cv2.resize(img, (640, 480))
                     with self._lock:
                         self._image = img
