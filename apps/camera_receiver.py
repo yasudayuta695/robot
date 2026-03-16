@@ -130,7 +130,7 @@ class CameraReceiver:
 
         # 前フレーム中心を使った横方向の探索帯で黒ノイズ誤検出を抑える
         center_hint = int(self._prev_center_x) if self._prev_center_x is not None else (w // 2)
-        corridor_half = int(w * (0.35 if self._prev_center_x is not None else 0.45))
+        corridor_half = int(w * (0.15 if self._prev_center_x is not None else 0.20))
         x1 = max(0, center_hint - corridor_half)
         x2 = min(w, center_hint + corridor_half)
         if x2 > x1:
@@ -219,32 +219,131 @@ class CameraReceiver:
         target_mask = np.zeros_like(mask)
         cv2.drawContours(target_mask, [target], -1, 255, thickness=cv2.FILLED)
 
-        # 黒ライン中心を各y行で求め、緑の折れ線として描画（曲線にも追従しやすい）
-        ys_all, xs_all = np.where(target_mask > 0)
-        row_indices = np.unique(ys_all)
-        row_centers = []
-        row_widths = []
-        for r in row_indices:
-            row_xs = xs_all[ys_all == r]
-            if row_xs.size >= 2:
-                x_min = int(row_xs.min())
-                x_max = int(row_xs.max())
-                row_centers.append((x_min + x_max) / 2.0)
-                row_widths.append(x_max - x_min)
-            else:
-                row_centers.append(np.nan)
-                row_widths.append(0)
+        # 行ごとに連続区間を追跡し、分岐/ノイズ混在でも一本の中心線を選ぶ
+        # 下側ノイズの影響を減らすため、中段のシードから上下に追跡する
+        roi_h = target_mask.shape[0]
+        seed_x = float(self._prev_center_x) if self._prev_center_x is not None else (w * 0.5)
+        seed_x = float(np.clip(seed_x, 0.0, float(w - 1)))
 
-        row_centers_np = np.array(row_centers, dtype=np.float32)
-        valid_mask = ~np.isnan(row_centers_np)
-        if np.count_nonzero(valid_mask) < 8:
+        def row_segments(row: np.ndarray) -> list[tuple[float, float, int, int]]:
+            xs = np.flatnonzero(row > 0)
+            if xs.size < 2:
+                return []
+            split_idx = np.where(np.diff(xs) > 1)[0] + 1
+            segments = np.split(xs, split_idx)
+            result: list[tuple[float, float, int, int]] = []
+            for seg in segments:
+                if seg.size < 2:
+                    continue
+                x_min = int(seg[0])
+                x_max = int(seg[-1])
+                seg_w = x_max - x_min
+                if seg_w <= 1:
+                    continue
+                cx = 0.5 * (x_min + x_max)
+                result.append((float(cx), float(seg_w), x_min, x_max))
+            return result
+
+        seed_center_row = int(np.clip(roi_h * 0.62, 0, roi_h - 1))
+        seed_r0 = max(0, seed_center_row - 12)
+        seed_r1 = min(roi_h, seed_center_row + 13)
+
+        best_seed = None
+        best_seed_cost = float("inf")
+        for r in range(seed_r0, seed_r1):
+            segs = row_segments(target_mask[r, :])
+            for cx, seg_w, x_min, x_max in segs:
+                width_cost = max(0.0, seg_w - (0.35 * float(w))) * 0.35
+                border_penalty = 40.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
+                cost = abs(cx - seed_x) + width_cost + border_penalty
+                if cost < best_seed_cost:
+                    best_seed_cost = cost
+                    best_seed = (r, cx, seg_w)
+
+        if best_seed is None:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
 
-        valid_rows = row_indices[valid_mask].astype(np.int32)
-        valid_centers = row_centers_np[valid_mask].astype(np.float32)
-        valid_widths = np.array(row_widths, dtype=np.float32)[valid_mask]
+        seed_row, seed_cx, seed_w = best_seed
+
+        def track_direction(start_row: int, step: int, start_x: float) -> tuple[list[int], list[float], list[float]]:
+            rows: list[int] = []
+            centers: list[float] = []
+            widths: list[float] = []
+            track_x = float(start_x)
+            misses = 0
+            max_misses = 18
+
+            end = roi_h if step > 0 else -1
+            for r in range(start_row, end, step):
+                segs = row_segments(target_mask[r, :])
+                if not segs:
+                    misses += 1
+                    if misses > max_misses:
+                        break
+                    continue
+
+                best = None
+                best_cost = float("inf")
+                for cx, seg_w, x_min, x_max in segs:
+                    jump_cost = abs(cx - track_x)
+                    width_cost = max(0.0, seg_w - (0.40 * float(w))) * 0.25
+                    border_penalty = 28.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
+                    cost = jump_cost + width_cost + border_penalty
+                    if cost < best_cost:
+                        best_cost = cost
+                        best = (cx, seg_w)
+
+                if best is None:
+                    misses += 1
+                    if misses > max_misses:
+                        break
+                    continue
+
+                cx, seg_w = best
+                jump_limit = (0.18 * float(w)) + (0.8 * seg_w)
+                if abs(cx - track_x) > jump_limit:
+                    misses += 1
+                    if misses > max_misses:
+                        break
+                    continue
+
+                rows.append(r)
+                centers.append(cx)
+                widths.append(seg_w)
+                track_x = 0.75 * track_x + 0.25 * cx
+                misses = 0
+
+            return rows, centers, widths
+
+        up_rows, up_centers, up_widths = track_direction(seed_row - 1, -1, seed_cx)
+        down_rows, down_centers, down_widths = track_direction(seed_row + 1, 1, seed_cx)
+
+        tracked_rows = [seed_row] + up_rows + down_rows
+        tracked_centers = [seed_cx] + up_centers + down_centers
+        tracked_widths = [seed_w] + up_widths + down_widths
+
+        if len(tracked_rows) < 8:
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
+        # 補間用に上→下へ並び替える
+        order = np.argsort(np.array(tracked_rows, dtype=np.int32))
+        tracked_rows_np = np.array(tracked_rows, dtype=np.int32)[order]
+        tracked_centers_np = np.array(tracked_centers, dtype=np.float32)[order]
+        tracked_widths_np = np.array(tracked_widths, dtype=np.float32)[order]
+
+        # 重複rowがあれば最初の1件を採用
+        valid_rows, unique_idx = np.unique(tracked_rows_np, return_index=True)
+        valid_centers = tracked_centers_np[unique_idx]
+        valid_widths = tracked_widths_np[unique_idx]
+
+        if valid_rows.size < 8:
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
 
         # 端で細くなる部分は中心が暴れやすいので、極端に細い行を除外
         median_width = float(np.median(valid_widths))
