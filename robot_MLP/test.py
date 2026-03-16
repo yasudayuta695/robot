@@ -1,12 +1,37 @@
 import argparse
 import csv
+import json
+import os
 from typing import List
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from train import DrivingLogSequenceDataset, LineTraceMLP
+from train import DrivingLogSequenceDataset, LineTraceMLP, resolve_csv_paths
+
+
+def load_csv_paths_from_split_report(split_report_path: str, split_name: str) -> List[str]:
+    with open(split_report_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if split_name not in payload:
+        raise ValueError(f"split '{split_name}' is not found in split report: {split_report_path}")
+
+    csv_paths = payload.get(split_name, [])
+    if not isinstance(csv_paths, list):
+        raise ValueError(f"split report field '{split_name}' must be a list")
+
+    resolved: List[str] = []
+    for p in csv_paths:
+        p_abs = os.path.abspath(os.path.expanduser(str(p)))
+        if not os.path.isfile(p_abs):
+            raise ValueError(f"CSV from split report not found: {p_abs}")
+        resolved.append(p_abs)
+
+    if not resolved:
+        raise ValueError(f"split '{split_name}' has no CSV paths in report: {split_report_path}")
+    return resolved
 
 
 def evaluate_model(
@@ -95,8 +120,15 @@ def save_predictions_csv(path: str, preds: np.ndarray, targets: np.ndarray) -> N
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate trained MLP model on driving_log CSV.")
-    parser.add_argument("--csv-path", type=str, required=True, help="Path to test driving_log.csv")
+    parser.add_argument(
+        "--csv-path",
+        type=str,
+        default="",
+        help="Path to one test driving_log.csv file OR a directory containing multiple session folders",
+    )
     parser.add_argument("--weights-path", type=str, required=True, help="Path to trained model .pt (state_dict)")
+    parser.add_argument("--split-report-path", type=str, default="", help="Optional dataset split JSON from train.py")
+    parser.add_argument("--split-name", type=str, default="test", choices=["train", "val", "test"], help="Which split to evaluate when split report is provided")
     parser.add_argument("--history", type=int, default=10, help="Frame history length used during training")
     parser.add_argument("--hidden1", type=int, default=64, help="Hidden layer size 1 (must match training)")
     parser.add_argument("--hidden2", type=int, default=32, help="Hidden layer size 2 (must match training)")
@@ -108,7 +140,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(args: argparse.Namespace) -> None:
-    dataset = DrivingLogSequenceDataset(csv_path=args.csv_path, history=args.history)
+    if args.split_report_path:
+        csv_paths = load_csv_paths_from_split_report(args.split_report_path, args.split_name)
+        print(f"Using split report: split={args.split_name}, csvs={len(csv_paths)}")
+    else:
+        if not args.csv_path:
+            raise ValueError("Either --csv-path or --split-report-path is required")
+        csv_paths = resolve_csv_paths(args.csv_path)
+    dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history)
+    print(f"Loaded {len(csv_paths)} csv file(s), total rows={len(dataset)}")
     input_dim = args.history * 9
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))

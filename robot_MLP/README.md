@@ -55,6 +55,8 @@ Notes:
 
 Run from project root or from `robot_MLP/`.
 
+### Yasuda Example (bash)
+
 ```bash
 python /home/cr7_yas97/ss2025robot/robot_MLP/train.py \
   --csv-path /path/to/driving_log.csv \
@@ -76,12 +78,47 @@ Main outputs:
 - `model.onnx` (for C++ / OpenCV DNN runtime)
 - `learning_curve.png` (if not disabled)
 
+You can also pass a directory to `--csv-path`.
+In that case, `train.py` recursively collects all `driving_log.csv` files under it.
+
+### Ryuryu Example (Windows, all sessions under camera_1)
+
+```bat
+python \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\train.py ^
+  --csv-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\dataset\camera_1 ^
+  --holdout-unit hour ^
+  --split-report-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\dataset_split.json ^
+  --epochs 80 ^
+  --batch-size 64 ^
+  --lr 1e-3 ^
+  --history 10 ^
+  --val-ratio 0.1 ^
+  --test-ratio 0.15 ^
+  --early-stopping ^
+  --patience 10 ^
+  --min-delta 1e-4 ^
+  --weights-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\model.pt ^
+  --onnx-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\model.onnx ^
+  --curve-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\learning_curve.png
+```
+
 Useful options:
 - `--val-ratio 0`: train without validation split
 - `--no-curve`: skip curve image generation
 - `--no-restore-best`: keep final epoch model instead of best validation model
+- `--test-ratio 0.15`: hold out unseen sessions for final test
+- `--split-report-path dataset_split.json`: save train/val/test CSV assignment
+- `--holdout-unit hour`: hold out by hour block (same hour sessions stay together)
+
+Session split behavior (implemented):
+- Split unit is session directory (not frame).
+- Split is stratified by `drive_type` folder.
+- `test` split is never used in training.
+- With `--holdout-unit hour`, same-hour sessions are never split across train/val/test.
 
 ## 5. Test / Evaluate
+
+### Yasuda Example (bash)
 
 ```bash
 python /home/cr7_yas97/ss2025robot/robot_MLP/test.py \
@@ -93,6 +130,32 @@ python /home/cr7_yas97/ss2025robot/robot_MLP/test.py \
   --pred-csv-path /home/cr7_yas97/ss2025robot/robot_MLP/test_predictions.csv
 ```
 
+### Ryuryu Example (Windows, evaluate all CSVs under camera_1)
+
+```bat
+python \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\test.py ^
+  --csv-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\dataset\camera_1 ^
+  --weights-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\model.pt ^
+  --history 10 ^
+  --hidden1 64 ^
+  --hidden2 32 ^
+  --pred-csv-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\test_predictions.csv
+```
+
+### Ryuryu Recommended (Windows, unseen held-out test split)
+
+```bat
+python \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\test.py ^
+  --split-report-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\dataset_split.json ^
+  --split-name test ^
+  --weights-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\model.pt ^
+  --history 10 ^
+  --hidden1 64 ^
+  --hidden2 32 ^
+  --pred-csv-path \\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\robot_MLP\test_predictions.csv
+```
+
+  
 Printed metrics:
 - MSE (overall/left/right)
 - MAE (overall/left/right)
@@ -113,9 +176,12 @@ Steps:
 1. Train and export `model.onnx` to `robot_MLP/`.
 2. Launch app:
 
+### Yasuda Example (bash)
+
 ```bash
 python /home/cr7_yas97/ss2025robot/apps/pi_pc_app.py
 ```
+
 
 3. Switch control mode to `AI (ONNX)`.
 4. Load ONNX model (auto-load attempts default path).
