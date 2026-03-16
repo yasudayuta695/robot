@@ -218,6 +218,51 @@ class UnifiedApp:
         self.near_threshold_value_label = tk.Label(self.threshold_frame, text=str(near_threshold), width=4)
         self.near_threshold_value_label.pack(side=tk.LEFT)
 
+        self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
+        self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+
+        tk.Label(self.dpad_sensitivity_frame, text="十字キー感度(前進):").pack(side=tk.LEFT)
+        self.dpad_drive_scale_var = tk.DoubleVar(value=float(self.config.dpad_drive_speed_scale))
+        self.dpad_drive_scale_slider = tk.Scale(
+            self.dpad_sensitivity_frame,
+            from_=0.20,
+            to=2.00,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.dpad_drive_scale_var,
+            command=self.on_dpad_drive_sensitivity_change,
+            showvalue=False,
+            length=140,
+        )
+        self.dpad_drive_scale_slider.pack(side=tk.LEFT)
+        self.dpad_drive_scale_value_label = tk.Label(
+            self.dpad_sensitivity_frame,
+            text=f"{self.get_dpad_drive_scale():.2f}",
+            width=5,
+        )
+        self.dpad_drive_scale_value_label.pack(side=tk.LEFT, padx=(0, 16))
+
+        tk.Label(self.dpad_sensitivity_frame, text="十字キー感度(旋回):").pack(side=tk.LEFT)
+        self.dpad_turn_scale_var = tk.DoubleVar(value=float(self.config.dpad_turn_speed_scale))
+        self.dpad_turn_scale_slider = tk.Scale(
+            self.dpad_sensitivity_frame,
+            from_=0.10,
+            to=2.00,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.dpad_turn_scale_var,
+            command=self.on_dpad_turn_sensitivity_change,
+            showvalue=False,
+            length=140,
+        )
+        self.dpad_turn_scale_slider.pack(side=tk.LEFT)
+        self.dpad_turn_scale_value_label = tk.Label(
+            self.dpad_sensitivity_frame,
+            text=f"{self.get_dpad_turn_scale():.2f}",
+            width=5,
+        )
+        self.dpad_turn_scale_value_label.pack(side=tk.LEFT)
+
         self.path_info_label = tk.Label(
             self.main_frame,
             text=(
@@ -301,14 +346,30 @@ class UnifiedApp:
         _, near = self.camera_receiver.set_thresholds(near_threshold=int(self.near_threshold_var.get()))
         self.near_threshold_value_label.config(text=str(near))
 
+    def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
+        self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
+        if self.control_mode.get() == "dpad" and self.active_dirs:
+            self.apply_dpad_keys()
+
+    def on_dpad_turn_sensitivity_change(self, _value: str) -> None:
+        self.dpad_turn_scale_value_label.config(text=f"{self.get_dpad_turn_scale():.2f}")
+        if self.control_mode.get() == "dpad" and self.active_dirs:
+            self.apply_dpad_keys()
+
     def get_drive_speed(self) -> int:
         return max(0, min(100, int(self.drive_speed_var.get())))
 
+    def get_dpad_drive_scale(self) -> float:
+        return max(0.05, float(self.dpad_drive_scale_var.get()))
+
+    def get_dpad_turn_scale(self) -> float:
+        return max(0.05, float(self.dpad_turn_scale_var.get()))
+
     def get_dpad_drive_speed(self) -> int:
-        return int(self.get_drive_speed() * self.config.dpad_drive_speed_scale)
+        return int(self.get_drive_speed() * self.get_dpad_drive_scale())
 
     def get_dpad_turn_speed(self) -> int:
-        return int(self.get_drive_speed() * self.config.dpad_turn_speed_scale)
+        return int(self.get_drive_speed() * self.get_dpad_turn_scale())
 
     def toggle_recording(self) -> None:
         if self.recorder.state == RecorderState.IDLE:
