@@ -39,8 +39,8 @@ class CameraReceiver:
         vis = img.copy()
         h, w = vis.shape[:2]
 
-        # 遠/中/近も取りたいので、ROIはやや広めに設定
-        roi_top = int(h * 0.20)
+        # 奥側も取りたい場合はこの値を小さくする（0.20 -> 0.10）
+        roi_top = int(h * 0.10)
         roi = vis[roi_top:, :]
 
         # 黒抽出
@@ -105,36 +105,40 @@ class CameraReceiver:
                 cv2.LINE_AA,
             )
 
-        # 遠/中/近 3点（各帯域でライン中心を算出）
-        zones = [("Far", 0, y1), ("Mid", y1, y2), ("Near", y2, h)]
-        for name, z0, z1 in zones:
+        # 遠/中/近 3点（固定深度位置で算出）
+        zones = [
+            ("Far", 0, y1, y1 // 2),
+            ("Mid", y1, y2, (y1 + y2) // 2),
+            ("Near", y2, h, (y2 + h) // 2),
+        ]
+        for name, z0, z1, ay_global in zones:
             ry0 = max(0, z0 - roi_top)
             ry1 = min(target_mask.shape[0], z1 - roi_top)
             if ry1 <= ry0:
                 continue
 
-            strip = target_mask[ry0:ry1, :]
+            # 帯域中央の固定y（ROI座標）
+            ay = int(np.clip(ay_global - roi_top, ry0, ry1 - 1))
+
+            # 固定y付近の細い帯で中心xと幅を計算
+            band_top = max(ry0, ay - 6)
+            band_bot = min(ry1, ay + 7)
+            strip = target_mask[band_top:band_bot, :]
+
             ys, xs = np.where(strip > 0)
             if xs.size < 10:
                 continue
 
-            centers = []
+            px = int(np.median(xs))
+
             widths = []
             for rr in np.unique(ys):
                 row_xs = xs[ys == rr]
                 if row_xs.size >= 2:
-                    x_min = int(row_xs.min())
-                    x_max = int(row_xs.max())
-                    centers.append((x_min + x_max) / 2.0)
-                    widths.append(x_max - x_min)
-
-            if not centers:
-                continue
-
-            px = int(np.median(centers))
-            py = int(roi_top + ry0 + np.median(np.unique(ys)))
+                    widths.append(int(row_xs.max() - row_xs.min()))
             wz = int(np.median(widths)) if widths else 0
 
+            py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
             cv2.putText(
                 vis,
