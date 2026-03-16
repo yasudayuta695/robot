@@ -64,7 +64,7 @@ def camera_thread():
     picam2.start()
     picam2.set_controls({"AeEnable":False,
                         "AwbEnable":False,
-                        "ExposureTime":3000,  # 露光時間（マイクロ秒）
+                        "ExposureTime":5000,  # 露光時間（マイクロ秒）
                         "AnalogueGain": 1.0})   # アナログゲイン（例: 4倍）
     print("カメラ配信スレッド起動（PCからの接続待機中...）")
     try:

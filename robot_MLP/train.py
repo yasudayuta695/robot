@@ -1,9 +1,10 @@
 import argparse
 import csv
+import json
 import os
 import random
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -48,6 +49,150 @@ def _clip_target(value: float) -> float:
     return float(np.clip(value, -1.0, 1.0))
 
 
+def resolve_csv_paths(csv_path: str) -> List[str]:
+    """
+    Accept either:
+    - one CSV file path
+    - one directory path containing many session folders
+
+    For directory input, recursively collect all driving_log.csv files.
+    """
+    if not csv_path:
+        raise ValueError("csv_path is empty")
+
+    norm_path = os.path.abspath(os.path.expanduser(csv_path))
+
+    if os.path.isfile(norm_path):
+        return [norm_path]
+
+    if os.path.isdir(norm_path):
+        collected: List[str] = []
+        for root, _dirs, files in os.walk(norm_path):
+            if "driving_log.csv" in files:
+                collected.append(os.path.join(root, "driving_log.csv"))
+        collected.sort()
+        if not collected:
+            raise ValueError(f"No driving_log.csv found under directory: {norm_path}")
+        return collected
+
+    raise ValueError(f"csv path does not exist: {csv_path}")
+
+
+def infer_session_and_type(csv_file: str) -> Tuple[str, str]:
+    norm = os.path.normpath(csv_file)
+    session_id = os.path.basename(os.path.dirname(norm))
+    drive_type = os.path.basename(os.path.dirname(os.path.dirname(norm)))
+    return session_id, drive_type
+
+
+def infer_holdout_group_key(session_id: str, holdout_unit: str) -> str:
+    # session format: YYYYMMDD_HHMMSS_microsec
+    parts = session_id.split("_")
+    if holdout_unit == "session":
+        return session_id
+
+    if holdout_unit == "hour":
+        if len(parts) >= 2 and len(parts[0]) == 8 and len(parts[1]) >= 2:
+            return f"{parts[0]}_{parts[1][:2]}"
+        return session_id
+
+    raise ValueError(f"Unsupported holdout_unit: {holdout_unit}")
+
+
+def _allocate_counts_per_type(n_items: int, val_ratio: float, test_ratio: float) -> Tuple[int, int, int]:
+    if n_items <= 0:
+        return 0, 0, 0
+    if n_items == 1:
+        return 1, 0, 0
+    if n_items == 2:
+        n_val = 1 if val_ratio > 0.0 else 0
+        return 2 - n_val, n_val, 0
+
+    n_val = int(round(n_items * max(0.0, val_ratio)))
+    n_test = int(round(n_items * max(0.0, test_ratio)))
+
+    if val_ratio > 0.0 and n_val == 0:
+        n_val = 1
+    if test_ratio > 0.0 and n_test == 0:
+        n_test = 1
+
+    while (n_val + n_test) > (n_items - 1):
+        if n_test >= n_val and n_test > 0:
+            n_test -= 1
+        elif n_val > 0:
+            n_val -= 1
+        else:
+            break
+
+    n_train = n_items - n_val - n_test
+    if n_train <= 0:
+        n_train = 1
+        if n_test > 0:
+            n_test -= 1
+        elif n_val > 0:
+            n_val -= 1
+    return n_train, n_val, n_test
+
+
+def split_csv_paths_by_session(
+    csv_paths: Sequence[str],
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    holdout_unit: str,
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Split by session (not by frame), stratified per drive_type.
+    This keeps all rows from one session in exactly one split.
+    """
+    grouped: Dict[str, Dict[str, List[str]]] = {}
+    for csv_file in csv_paths:
+        session_id, drive_type = infer_session_and_type(csv_file)
+        holdout_key = infer_holdout_group_key(session_id, holdout_unit)
+        grouped.setdefault(drive_type, {}).setdefault(holdout_key, []).append(csv_file)
+
+    rng = random.Random(seed)
+    train_csvs: List[str] = []
+    val_csvs: List[str] = []
+    test_csvs: List[str] = []
+
+    for drive_type in sorted(grouped.keys()):
+        group_items = [(key, sorted(paths)) for key, paths in grouped[drive_type].items()]
+        rng.shuffle(group_items)
+
+        n_train, n_val, n_test = _allocate_counts_per_type(len(group_items), val_ratio, test_ratio)
+
+        test_part = group_items[:n_test]
+        val_part = group_items[n_test:n_test + n_val]
+        train_part = group_items[n_test + n_val:n_test + n_val + n_train]
+
+        for _group, paths in train_part:
+            train_csvs.extend(paths)
+        for _group, paths in val_part:
+            val_csvs.extend(paths)
+        for _group, paths in test_part:
+            test_csvs.extend(paths)
+
+    train_csvs.sort()
+    val_csvs.sort()
+    test_csvs.sort()
+    return train_csvs, val_csvs, test_csvs
+
+
+def save_split_report(path: str, train_csvs: Sequence[str], val_csvs: Sequence[str], test_csvs: Sequence[str]) -> None:
+    payload = {
+        "train": list(train_csvs),
+        "val": list(val_csvs),
+        "test": list(test_csvs),
+    }
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"Saved split report: {path}")
+
+
 class DrivingLogSequenceDataset(Dataset):
     """
     One sample = concatenated 10-frame input (90,) ending at current index
@@ -57,13 +202,28 @@ class DrivingLogSequenceDataset(Dataset):
     replicating frame 0 (no zero padding).
     """
 
-    def __init__(self, csv_path: str, history: int = 10) -> None:
+    def __init__(self, csv_paths: Sequence[str], history: int = 10) -> None:
         if history <= 0:
             raise ValueError("history must be >= 1")
+        if not csv_paths:
+            raise ValueError("csv_paths is empty")
+
         self.history = history
-        self.samples: List[Sample] = self._load_csv(csv_path)
-        if len(self.samples) == 0:
-            raise ValueError(f"No rows found in csv: {csv_path}")
+        self.sequence_sources: List[str] = []
+        self.sequences: List[List[Sample]] = []
+        self.index_map: List[Tuple[int, int]] = []
+
+        for src in csv_paths:
+            seq = self._load_csv(src)
+            if len(seq) == 0:
+                continue
+            seq_idx = len(self.sequences)
+            self.sequence_sources.append(src)
+            self.sequences.append(seq)
+            self.index_map.extend((seq_idx, row_idx) for row_idx in range(len(seq)))
+
+        if len(self.index_map) == 0:
+            raise ValueError("No usable rows found in provided csv path(s)")
 
     def _load_csv(self, csv_path: str) -> List[Sample]:
         loaded: List[Sample] = []
@@ -89,7 +249,7 @@ class DrivingLogSequenceDataset(Dataset):
         return loaded
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.index_map)
 
     def _window_indices(self, index: int) -> List[int]:
         start = index - (self.history - 1)
@@ -102,9 +262,12 @@ class DrivingLogSequenceDataset(Dataset):
         if isinstance(index, torch.Tensor):
             index = int(index.item())
 
-        idxs = self._window_indices(index)
-        stacked = np.concatenate([self.samples[i].feature for i in idxs], axis=0)  # (history*9,)
-        target = self.samples[index].target  # (2,)
+        seq_idx, row_idx = self.index_map[index]
+        seq = self.sequences[seq_idx]
+
+        idxs = self._window_indices(row_idx)
+        stacked = np.concatenate([seq[i].feature for i in idxs], axis=0)  # (history*9,)
+        target = seq[row_idx].target  # (2,)
 
         x = torch.from_numpy(stacked)
         y = torch.from_numpy(target)
@@ -200,15 +363,46 @@ def train(args: argparse.Namespace) -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    dataset = DrivingLogSequenceDataset(csv_path=args.csv_path, history=args.history)
+    csv_paths = resolve_csv_paths(args.csv_path)
+    is_directory_input = os.path.isdir(os.path.abspath(os.path.expanduser(args.csv_path)))
+
+    if is_directory_input and len(csv_paths) > 1:
+        train_csvs, val_csvs, test_csvs = split_csv_paths_by_session(
+            csv_paths=csv_paths,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.split_seed,
+            holdout_unit=args.holdout_unit,
+        )
+
+        if len(train_csvs) == 0:
+            raise ValueError("No training CSVs after split. Check dataset size and split ratios.")
+
+        train_set = DrivingLogSequenceDataset(csv_paths=train_csvs, history=args.history)
+        val_set = DrivingLogSequenceDataset(csv_paths=val_csvs, history=args.history) if len(val_csvs) > 0 else None
+        print(
+            f"Loaded {len(csv_paths)} csv file(s) from directory. "
+            f"holdout_unit={args.holdout_unit} "
+            f"train_csvs={len(train_csvs)} val_csvs={len(val_csvs)} test_csvs={len(test_csvs)}"
+        )
+
+        if args.split_report_path:
+            save_split_report(args.split_report_path, train_csvs, val_csvs, test_csvs)
+    else:
+        dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history)
+        print(f"Loaded {len(csv_paths)} csv file(s), total rows={len(dataset)}")
+
+        train_idx, val_idx = split_indices_sequential(len(dataset), args.val_ratio)
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, val_idx)
+
+        if is_directory_input and len(csv_paths) == 1:
+            print("[Warn] Only one CSV found under directory; session-level split is not applicable.")
+
     input_dim = args.history * len(FEATURE_COLUMNS)
 
     if input_dim != 90:
         print(f"[Info] input_dim={input_dim}. Requirement is 90 when history=10.")
-
-    train_idx, val_idx = split_indices_sequential(len(dataset), args.val_ratio)
-    train_set = Subset(dataset, train_idx)
-    val_set = Subset(dataset, val_idx)
 
     train_loader = DataLoader(
         train_set,
@@ -218,13 +412,15 @@ def train(args: argparse.Namespace) -> None:
         drop_last=False,
     )
 
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
+    val_loader = None
+    if val_set is not None and len(val_set) > 0:
+        val_loader = DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+        )
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -234,7 +430,7 @@ def train(args: argparse.Namespace) -> None:
 
     train_losses: List[float] = []
     val_losses: List[float] = []
-    use_validation = len(val_set) > 0
+    use_validation = val_loader is not None
     best_val_loss = float("inf")
     best_state_dict = None
     no_improve_count = 0
@@ -334,12 +530,21 @@ def train(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train MLP for line-trace motor output regression and export ONNX.")
-    parser.add_argument("--csv-path", type=str, required=True, help="Path to driving_log.csv")
+    parser.add_argument(
+        "--csv-path",
+        type=str,
+        required=True,
+        help="Path to one driving_log.csv file OR a directory containing multiple session folders",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--history", type=int, default=10, help="Number of frames to stack (10 -> input 90)")
     parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--test-ratio", type=float, default=0.15, help="Session-level test split ratio when csv-path is a directory")
+    parser.add_argument("--split-seed", type=int, default=42, help="Random seed for session-level splitting")
+    parser.add_argument("--holdout-unit", type=str, default="hour", choices=["session", "hour"], help="Group unit for split holdout when csv-path is a directory")
+    parser.add_argument("--split-report-path", type=str, default="dataset_split.json", help="Output JSON path of train/val/test csv split")
     parser.add_argument("--hidden1", type=int, default=64)
     parser.add_argument("--hidden2", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
