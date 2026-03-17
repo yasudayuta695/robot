@@ -221,9 +221,10 @@ class CameraReceiver:
 
         def max_segment_width_px(row_index: int) -> int:
             t = float(row_index) / max(1.0, float(roi_h - 1))
-            base_ratio = 0.20 + (0.22 * t)
-            relax_ratio = min(0.10, 0.02 * float(self._consecutive_misses))
-            ratio = float(np.clip(base_ratio + relax_ratio, 0.18, 0.52))
+            # 巨大な暗領域を避けるため、許容幅は全体的に厳しめ
+            base_ratio = 0.14 + (0.16 * t)
+            relax_ratio = min(0.04, 0.01 * float(self._consecutive_misses))
+            ratio = float(np.clip(base_ratio + relax_ratio, 0.12, 0.36))
             return max(8, int(ratio * float(w)))
 
         def contour_score(cnt: np.ndarray) -> float:
@@ -240,12 +241,24 @@ class CameraReceiver:
             avg_row_width = area / max(1.0, float(bh))
             mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
 
+            touch_left = x <= 2
+            touch_right = (x + bw) >= (w - 2)
+            touch_top = y <= 2
+            touch_bottom = (y + bh) >= (roi_h - 2)
+
             # 線ではなく塊になった暗領域を除外
             if fill_ratio > 0.72 and (float(bh) / max(1.0, float(bw))) < 2.0:
                 return -1.0
             if bw_ratio > 0.62 and fill_ratio > 0.35:
                 return -1.0
             if avg_row_width > (mid_allowed_width * 1.25):
+                return -1.0
+            # 画面端にべったり張り付いた太い暗領域は除外
+            if (touch_left or touch_right) and bw_ratio > 0.38 and fill_ratio > 0.12 and span_ratio > 0.25:
+                return -1.0
+            if (touch_left and touch_right) and bw_ratio > 0.25:
+                return -1.0
+            if (touch_top and touch_bottom) and bw_ratio > 0.20 and fill_ratio > 0.22:
                 return -1.0
 
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
@@ -420,6 +433,14 @@ class CameraReceiver:
             valid_widths = valid_widths[stable_mask]
 
         if valid_rows.size < 8:
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
+        # 幅が異常に太い場合は誤検出扱い（見失いに倒す）
+        width_med = float(np.median(valid_widths))
+        width_p90 = float(np.percentile(valid_widths, 90))
+        if width_med > (0.28 * float(w)) or width_p90 > (0.38 * float(w)):
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
