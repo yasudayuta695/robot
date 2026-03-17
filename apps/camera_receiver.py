@@ -303,9 +303,9 @@ class CameraReceiver:
             t = float(row_index) / max(1.0, float(roi_h - 1))
             # カーブ時の幅変化を許容しつつ、巨大塊は除外
             base_ratio = 0.18 + (0.22 * t)
-            relax_ratio = min(0.08, 0.02 * float(self._consecutive_misses))
-            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.48))
-            return max(8, int(ratio * float(w)))
+            relax_ratio = min(0.10, 0.025 * float(self._consecutive_misses))
+            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.52))
+            return int(np.clip(int(ratio * float(w)), 8, 220))
 
         def contour_score(cnt: np.ndarray) -> Tuple[float, str, Dict[str, float]]:
             area = float(cv2.contourArea(cnt))
@@ -345,13 +345,28 @@ class CameraReceiver:
                 return -1.0, "blob_fill", meta
             if bw_ratio > 0.62 and fill_ratio > 0.35:
                 return -1.0, "blob_wide", meta
-            if avg_row_width > (mid_allowed_width * 1.25):
+            if avg_row_width > (mid_allowed_width * 1.55):
                 return -1.0, "row_wide", meta
+            # タイルの目地など、細く横長で密度の低い暗線を除外
+            if avg_row_width < 10.0 and fill_ratio < 0.24 and span_ratio < 0.32 and aspect < 0.95:
+                return -1.0, "seam_thin", meta
+            if bw_ratio > 0.30 and aspect < 0.42 and avg_row_width < 16.0 and fill_ratio < 0.34:
+                return -1.0, "seam_horizontal", meta
+            # 画面内を蛇行して長く伸びる細線（目地/反射エッジ）を除外
+            if fill_ratio < 0.12 and avg_row_width < 14.0 and bw_ratio > 0.34 and span_ratio > 0.42:
+                return -1.0, "seam_snake", meta
             # 画面端にべったり張り付いた太い暗領域は除外
-            if (touch_left or touch_right) and bw_ratio > 0.38 and fill_ratio > 0.12 and span_ratio > 0.25:
+            # ただし、カーブ本線は端に接しやすいので条件を厳しめにして誤除外を防ぐ
+            if (
+                (touch_left or touch_right)
+                and bw_ratio > 0.70
+                and fill_ratio > 0.26
+                and span_ratio > 0.30
+                and aspect < 1.85
+            ):
                 return -1.0, "edge_blob", meta
             # 画面端の細い縦スジ（パネル境界など）を除外
-            if (touch_left or touch_right) and bw_ratio < 0.06 and span_ratio > 0.55 and fill_ratio > 0.22 and aspect > 2.8:
+            if (touch_left or touch_right) and bw_ratio < 0.05 and span_ratio > 0.65 and fill_ratio > 0.30 and aspect > 3.4:
                 return -1.0, "edge_strip", meta
             if (touch_left and touch_right) and bw_ratio > 0.25:
                 return -1.0, "full_span", meta
@@ -362,9 +377,18 @@ class CameraReceiver:
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
             cx = float(x) + float(bw) * 0.5
 
-            center_ref = self._prev_center_x if self._prev_center_x is not None else (w * 0.5)
-            dist_center = abs(cx - float(center_ref)) / max(1.0, (w * 0.5))
-            center_bonus = max(0.45, 1.0 - 0.55 * dist_center)
+            if self._prev_center_x is not None and self._consecutive_misses < 2:
+                center_ref = float(self._prev_center_x)
+                center_weight = 0.55
+                center_floor = 0.45
+            else:
+                # 見失い時は中心寄りバイアスを弱めて、反対側カーブの再捕捉を優先
+                center_ref = float(w * 0.5)
+                center_weight = 0.28
+                center_floor = 0.62
+
+            dist_center = abs(cx - center_ref) / max(1.0, (w * 0.5))
+            center_bonus = max(center_floor, 1.0 - center_weight * dist_center)
 
             span_bonus = 0.7 + 1.2 * min(span_ratio, 1.0)
             bottom_bonus = 0.7 + 0.6 * min(bottom_reach, 1.0)
@@ -440,16 +464,16 @@ class CameraReceiver:
             return result
 
         seed_center_row = int(np.clip(roi_h * 0.52, 0, roi_h - 1))
-        seed_r0 = max(0, seed_center_row - 24)
-        seed_r1 = min(roi_h, seed_center_row + 25)
+        seed_r0 = max(0, seed_center_row - 30)
+        seed_r1 = min(roi_h, seed_center_row + 31)
 
         best_seed = None
         best_seed_cost = float("inf")
         for r in range(seed_r0, seed_r1):
             segs = row_segments(r, target_mask[r, :])
             for cx, seg_w, x_min, x_max in segs:
-                width_cost = max(0.0, seg_w - (0.35 * float(w))) * 0.35
-                border_penalty = 40.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
+                width_cost = max(0.0, seg_w - (0.45 * float(w))) * 0.20
+                border_penalty = 20.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
                 cost = abs(cx - seed_x) + width_cost + border_penalty
                 if cost < best_seed_cost:
                     best_seed_cost = cost
@@ -475,7 +499,7 @@ class CameraReceiver:
             track_w = max(8.0, float(start_w))
             prev_dx = 0.0
             misses = 0
-            max_misses = 18
+            max_misses = 24
 
             end = roi_h if step > 0 else -1
             for r in range(start_row, end, step):
@@ -491,9 +515,9 @@ class CameraReceiver:
                 for cx, seg_w, x_min, x_max in segs:
                     pred_x = track_x + (0.6 * prev_dx)
                     jump_cost = abs(cx - pred_x)
-                    width_consistency_cost = abs(float(seg_w) - track_w) * 0.25
-                    width_cost = max(0.0, seg_w - (0.40 * float(w))) * 0.25
-                    border_penalty = 28.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
+                    width_consistency_cost = abs(float(seg_w) - track_w) * 0.18
+                    width_cost = max(0.0, seg_w - (0.48 * float(w))) * 0.15
+                    border_penalty = 12.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
                     cost = jump_cost + width_consistency_cost + width_cost + border_penalty
                     if cost < best_cost:
                         best_cost = cost
@@ -507,7 +531,7 @@ class CameraReceiver:
 
                 cx, seg_w = best
                 delta_x = float(cx - track_x)
-                jump_limit = (0.18 * float(w)) + (0.80 * float(seg_w)) + (1.20 * abs(prev_dx))
+                jump_limit = (0.24 * float(w)) + (0.95 * float(seg_w)) + (1.40 * abs(prev_dx))
                 if abs(delta_x) > jump_limit:
                     misses += 1
                     if misses > max_misses:
@@ -517,9 +541,9 @@ class CameraReceiver:
                 rows.append(r)
                 centers.append(cx)
                 widths.append(seg_w)
-                track_x = 0.75 * track_x + 0.25 * cx
+                track_x = 0.68 * track_x + 0.32 * cx
                 track_w = 0.75 * track_w + 0.25 * float(seg_w)
-                prev_dx = 0.60 * prev_dx + 0.40 * delta_x
+                prev_dx = 0.50 * prev_dx + 0.50 * delta_x
                 misses = 0
 
             return rows, centers, widths
@@ -554,7 +578,7 @@ class CameraReceiver:
 
         # 端で細くなる部分は中心が暴れやすいので、極端に細い行を除外
         median_width = float(np.median(valid_widths))
-        min_stable_width = max(2.0, median_width * 0.25)
+        min_stable_width = max(2.0, median_width * 0.18)
         stable_mask = valid_widths >= min_stable_width
         if np.count_nonzero(stable_mask) >= 8:
             valid_rows = valid_rows[stable_mask]
@@ -569,7 +593,83 @@ class CameraReceiver:
         # 幅が異常に太い場合は誤検出扱い（見失いに倒す）
         width_med = float(np.median(valid_widths))
         width_p90 = float(np.percentile(valid_widths, 90))
-        if width_med > (0.28 * float(w)) or width_p90 > (0.38 * float(w)):
+        # 幅だけで早期に落としすぎると本線を取りこぼすので、極端な場合のみ除外
+        if width_med > (0.18 * float(w)) and width_p90 > (0.28 * float(w)):
+            if debug_overlay_enabled:
+                cv2.putText(
+                    vis,
+                    "reject: too_wide",
+                    (10, 104),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
+        # Near帯に届かない細線は、目地/反射エッジの誤検出として弾く
+        near_anchor_global = int((2 * h) // 3)
+        near_anchor_row = int(np.clip(near_anchor_global - roi_top, 0, roi_h - 1))
+        has_near_support = bool(np.any(valid_rows >= max(0, near_anchor_row - 10)))
+        bottom_reach_ratio = float(valid_rows.max()) / max(1.0, float(roi_h - 1))
+        if (not has_near_support) and (width_p90 < 16.0):
+            if debug_overlay_enabled:
+                cv2.putText(
+                    vis,
+                    "reject: far_thin",
+                    (10, 122),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+        if width_med < 9.0 and bottom_reach_ratio < 0.72:
+            if debug_overlay_enabled:
+                cv2.putText(
+                    vis,
+                    "reject: thin_no_near",
+                    (10, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
+        # Near帯の支えが弱い（短い/細い）候補は安全側で除外
+        near_rows_mask = valid_rows >= near_anchor_row
+        near_rows_count = int(np.count_nonzero(near_rows_mask))
+        near_width_med = float(np.median(valid_widths[near_rows_mask])) if near_rows_count > 0 else 0.0
+        if near_rows_count < 14 and near_width_med < 14.0 and width_med < 11.0:
+            if debug_overlay_enabled:
+                cv2.putText(
+                    vis,
+                    "reject: near_weak",
+                    (10, 158),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            self._on_detection_lost()
+            self._set_latest_line_features(features)
+            return vis
+
+        # 細い線が中段の短い範囲だけ残る場合は、目地誤検出の可能性が高い
+        span_rows = int(valid_rows.max() - valid_rows.min() + 1)
+        span_ratio_rows = float(span_rows) / max(1.0, float(roi_h))
+        if width_med < 8.0 and width_p90 < 13.0 and span_ratio_rows < 0.35:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
