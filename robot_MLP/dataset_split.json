@@ -1,5 +1,29 @@
 {
   "train": [
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143211_109201/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143231_129621/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143252_928321/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143420_792122/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143521_318825/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143559_517686/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143638_156593/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143816_116920/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143844_233203/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_143916_572528/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_144001_262552/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_144021_720187/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_144039_520895/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_144135_766152/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/right_curve/20260316_144215_345175/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_133810_941565/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_133908_432602/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_133943_166663/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_134004_743546/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_134033_296492/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_134110_269013/driving_log.csv",
+    "/home/cr7_yas97/ss2025robot/dataset/camera_1/straight/20260316_134137_916973/driving_log.csv"
+  ],
+  "val": [
     "/home/cr7_yas97/ss2025robot/dataset/camera_2/straight/20260317_154111_197890/driving_log.csv",
     "/home/cr7_yas97/ss2025robot/dataset/camera_2/straight/20260317_154240_406563/driving_log.csv",
     "/home/cr7_yas97/ss2025robot/dataset/camera_2/straight/20260317_154356_521440/driving_log.csv",
@@ -17,6 +41,5 @@
     "/home/cr7_yas97/ss2025robot/dataset/camera_2/straight/20260317_155825_871036/driving_log.csv",
     "/home/cr7_yas97/ss2025robot/dataset/camera_2/straight/20260317_155903_162652/driving_log.csv"
   ],
-  "val": [],
   "test": []
 }

@@ -15,11 +15,13 @@ curve_slowdown_sensitivity=0.70
 # 推論出力の平滑化（0.0:無効 / 1.0:強い追従）
 ai_smoothing_alpha=0.35
 # ライン見失い時の保持フレーム数（長いほど復帰が遅くなる）
-ai_no_line_hold_frames=3
+ai_no_line_hold_frames=4
 # ライン見失い後の減速に使うフレーム数
-ai_no_line_brake_frames=8
+ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
 line_process_interval_ms=70
+# しきい値自動補正（見失いが多い場合は true 推奨）
+auto_threshold_enabled=true
 # AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
 ai_control_interval_ms=100
 # UI更新周期(ms)
@@ -30,11 +32,18 @@ pid_kp=0.95
 pid_ki=0.08
 pid_kd=0.22
 # PID出力の上限（操舵量）
-pid_output_limit=1.0
+pid_output_limit=0.35
 # 積分項の上限（windup対策）
 pid_integral_limit=1.5
 # ライン未検出時に停止するか
 pid_stop_on_no_line=true
+# 学習ゲインの時間平滑化（0.0:平滑なし, 1.0:非常に強い追従）
+pid_gain_smoothing_alpha=0.20
+# 操舵量のフレーム間変化上限（小さいほど暴れにくい）
+pid_steer_rate_limit=0.10
+# モータ符号補正（直進でその場回転する場合は見直す）
+motor_left_sign=-1
+motor_right_sign=1
 
 # カメラ選択肢
 camera_id=camera_1

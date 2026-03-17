@@ -350,12 +350,26 @@ def pid_terms_from_input(x: torch.Tensor, history: int) -> tuple[torch.Tensor, t
         raise ValueError(f"Input feature size mismatch: got {x.size(1)}, expected {history * frame_dim}")
 
     seq = x.view(x.size(0), history, frame_dim)
-    detect_mid = torch.clamp(seq[:, :, 1], 0.0, 1.0)
-    offset_mid = torch.clamp(seq[:, :, 4], -1.0, 1.0)
-    effective_error = detect_mid * offset_mid
+
+    detect = torch.clamp(seq[:, :, 0:3], 0.0, 1.0)
+    offset = torch.clamp(seq[:, :, 3:6], -1.0, 1.0)
+    zone_weights = x.new_tensor([0.20, 0.35, 0.45]).view(1, 1, 3)
+
+    weighted_detect = detect * zone_weights
+    weighted_sum = torch.sum(weighted_detect, dim=2)
+    weighted_error_num = torch.sum(weighted_detect * offset, dim=2)
+
+    eps = 1e-6
+    effective_error = torch.where(
+        weighted_sum > 0.01,
+        weighted_error_num / (weighted_sum + eps),
+        torch.zeros_like(weighted_sum),
+    )
 
     error = effective_error[:, -1]
-    integral = torch.mean(effective_error, dim=1)
+
+    valid = (weighted_sum > 0.01).float()
+    integral = torch.sum(effective_error * valid, dim=1) / (torch.sum(valid, dim=1) + eps)
     if history >= 2:
         derivative = effective_error[:, -1] - effective_error[:, -2]
     else:

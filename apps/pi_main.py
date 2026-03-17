@@ -79,6 +79,36 @@ def stop_all_motors(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> None:
     set_right_motor(0, pwm_a)
 
 
+def safe_shutdown_gpio(pwm_a: Optional[GPIO.PWM], pwm_b: Optional[GPIO.PWM]) -> None:
+    """Stop motors/PWM in a destructor-safe order before GPIO cleanup."""
+    try:
+        if pwm_a is not None and pwm_b is not None:
+            stop_all_motors(pwm_a, pwm_b)
+    except Exception:
+        pass
+
+    for pwm in (pwm_a, pwm_b):
+        if pwm is None:
+            continue
+        try:
+            pwm.stop()
+        except Exception:
+            pass
+
+    # Drop PWM references before GPIO.cleanup() so __del__ does not run after
+    # low-level handles are already released.
+    try:
+        del pwm_a
+        del pwm_b
+    except Exception:
+        pass
+
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
+
+
 @dataclass
 class PiRuntimeConfig:
     curve_slowdown_sensitivity: float = 0.70
@@ -89,12 +119,17 @@ class PiRuntimeConfig:
     ai_control_interval_ms: int = 100
     far_threshold: int = 100
     near_threshold: int = 70
+    auto_threshold_enabled: bool = True
     pid_kp: float = 0.95
     pid_ki: float = 0.08
     pid_kd: float = 0.22
     pid_output_limit: float = 1.0
     pid_integral_limit: float = 1.5
     pid_stop_on_no_line: bool = True
+    pid_gain_smoothing_alpha: float = 0.25
+    pid_steer_rate_limit: float = 0.18
+    motor_left_sign: int = -1
+    motor_right_sign: int = 1
 
 
 def _parse_bool(text: str) -> Optional[bool]:
@@ -195,6 +230,10 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
                     cfg.far_threshold = int(float(value))
                 elif key == "near_threshold":
                     cfg.near_threshold = int(float(value))
+                elif key == "auto_threshold_enabled":
+                    parsed = _parse_bool(value)
+                    if parsed is not None:
+                        cfg.auto_threshold_enabled = parsed
                 elif key == "pid_kp":
                     cfg.pid_kp = float(value)
                 elif key == "pid_ki":
@@ -209,6 +248,14 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
                     parsed = _parse_bool(value)
                     if parsed is not None:
                         cfg.pid_stop_on_no_line = parsed
+                elif key == "pid_gain_smoothing_alpha":
+                    cfg.pid_gain_smoothing_alpha = float(value)
+                elif key == "pid_steer_rate_limit":
+                    cfg.pid_steer_rate_limit = float(value)
+                elif key == "motor_left_sign":
+                    cfg.motor_left_sign = int(float(value))
+                elif key == "motor_right_sign":
+                    cfg.motor_right_sign = int(float(value))
             except ValueError:
                 continue
 
@@ -222,6 +269,10 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
     cfg.near_threshold = int(np.clip(cfg.near_threshold, 0, 255))
     cfg.pid_output_limit = float(np.clip(cfg.pid_output_limit, 0.05, 2.5))
     cfg.pid_integral_limit = float(np.clip(cfg.pid_integral_limit, 0.0, 10.0))
+    cfg.pid_gain_smoothing_alpha = float(np.clip(cfg.pid_gain_smoothing_alpha, 0.0, 1.0))
+    cfg.pid_steer_rate_limit = float(np.clip(cfg.pid_steer_rate_limit, 0.02, 0.50))
+    cfg.motor_left_sign = -1 if int(cfg.motor_left_sign) < 0 else 1
+    cfg.motor_right_sign = -1 if int(cfg.motor_right_sign) < 0 else 1
     return cfg
 
 
@@ -231,10 +282,12 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
 
     print(f"[pid] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    motor_left_sign = int(runtime_cfg.motor_left_sign)
+    motor_right_sign = int(runtime_cfg.motor_right_sign)
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
-    line_detector.set_auto_threshold_enabled(False)
+    line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),
         near_threshold=int(runtime_cfg.near_threshold),
@@ -316,8 +369,8 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
                     turn = int(np.round(steer * float(args.base_speed)))
                     left = int(np.clip(int(args.base_speed) + turn, -100, 100))
                     right = int(np.clip(int(args.base_speed) - turn, -100, 100))
-                    cmd_left = int(np.clip(left * MOTOR_LEFT_SIGN, -100, 100))
-                    cmd_right = int(np.clip(right * MOTOR_RIGHT_SIGN, -100, 100))
+                    cmd_left = int(np.clip(left * motor_left_sign, -100, 100))
+                    cmd_right = int(np.clip(right * motor_right_sign, -100, 100))
 
                 set_left_motor(cmd_left, pwm_b)
                 set_right_motor(cmd_right, pwm_a)
@@ -409,6 +462,8 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
     print(f"[local_ai] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    motor_left_sign = int(runtime_cfg.motor_left_sign)
+    motor_right_sign = int(runtime_cfg.motor_right_sign)
 
     onnx_path = os.path.abspath(os.path.expanduser(args.onnx_path))
     if not os.path.isfile(onnx_path):
@@ -417,7 +472,7 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
-    line_detector.set_auto_threshold_enabled(False)
+    line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),
         near_threshold=int(runtime_cfg.near_threshold),
@@ -440,8 +495,8 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
     camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
 
-    current_left_speed = 0
-    current_right_speed = 0
+    model_left_speed = 0
+    model_right_speed = 0
     last_control_ts = 0.0
     last_line_ts = 0.0
     cached_features = line_detector.get_latest_line_features()
@@ -486,16 +541,19 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
             if (now - last_control_ts) >= control_interval_sec:
                 left_speed, right_speed = ai_controller.predict_motor_speed(
                     line_features=cached_features,
-                    current_left_speed=current_left_speed,
-                    current_right_speed=current_right_speed,
+                    current_left_speed=model_left_speed,
+                    current_right_speed=model_right_speed,
                     base_speed=int(args.base_speed),
                 )
 
-                current_left_speed = int(np.clip(left_speed * MOTOR_LEFT_SIGN, -100, 100))
-                current_right_speed = int(np.clip(right_speed * MOTOR_RIGHT_SIGN, -100, 100))
+                model_left_speed = int(np.clip(left_speed, -100, 100))
+                model_right_speed = int(np.clip(right_speed, -100, 100))
 
-                set_left_motor(current_left_speed, pwm_b)
-                set_right_motor(current_right_speed, pwm_a)
+                hw_left_speed = int(np.clip(model_left_speed * motor_left_sign, -100, 100))
+                hw_right_speed = int(np.clip(model_right_speed * motor_right_sign, -100, 100))
+
+                set_left_motor(hw_left_speed, pwm_b)
+                set_right_motor(hw_right_speed, pwm_a)
                 last_control_ts = now
 
             if camera_sleep_sec > 0.0:
@@ -513,6 +571,8 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
     print(f"[pid_learned] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    motor_left_sign = int(runtime_cfg.motor_left_sign)
+    motor_right_sign = int(runtime_cfg.motor_right_sign)
 
     onnx_path = os.path.abspath(os.path.expanduser(args.onnx_path))
     if not os.path.isfile(onnx_path):
@@ -520,7 +580,7 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
-    line_detector.set_auto_threshold_enabled(False)
+    line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),
         near_threshold=int(runtime_cfg.near_threshold),
@@ -532,6 +592,10 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
         max_motor_speed=int(args.max_motor_speed),
         stop_on_no_line=bool(runtime_cfg.pid_stop_on_no_line),
         steer_limit=float(runtime_cfg.pid_output_limit),
+        no_line_hold_frames=int(runtime_cfg.ai_no_line_hold_frames),
+        no_line_brake_frames=int(runtime_cfg.ai_no_line_brake_frames),
+        gain_smoothing_alpha=float(runtime_cfg.pid_gain_smoothing_alpha),
+        steer_rate_limit=float(runtime_cfg.pid_steer_rate_limit),
     )
     print("[pid_learned] Loading ONNX model...")
     controller.load_model(onnx_path)
@@ -541,8 +605,8 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
     camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
 
-    current_left_speed = 0
-    current_right_speed = 0
+    model_left_speed = 0
+    model_right_speed = 0
     last_control_ts = 0.0
     last_line_ts = 0.0
     last_log_ts = 0.0
@@ -581,23 +645,26 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
             if (now - last_control_ts) >= control_interval_sec:
                 left_speed, right_speed = controller.predict_motor_speed(
                     line_features=cached_features,
-                    current_left_speed=current_left_speed,
-                    current_right_speed=current_right_speed,
+                    current_left_speed=model_left_speed,
+                    current_right_speed=model_right_speed,
                     base_speed=int(args.base_speed),
                 )
 
-                current_left_speed = int(np.clip(left_speed * MOTOR_LEFT_SIGN, -100, 100))
-                current_right_speed = int(np.clip(right_speed * MOTOR_RIGHT_SIGN, -100, 100))
+                model_left_speed = int(np.clip(left_speed, -100, 100))
+                model_right_speed = int(np.clip(right_speed, -100, 100))
 
-                set_left_motor(current_left_speed, pwm_b)
-                set_right_motor(current_right_speed, pwm_a)
+                hw_left_speed = int(np.clip(model_left_speed * motor_left_sign, -100, 100))
+                hw_right_speed = int(np.clip(model_right_speed * motor_right_sign, -100, 100))
+
+                set_left_motor(hw_left_speed, pwm_b)
+                set_right_motor(hw_right_speed, pwm_a)
                 last_control_ts = now
 
                 if (now - last_log_ts) >= 1.0:
                     kp, ki, kd = controller.last_gains
                     print(
-                        "[pid_learned] gain=(%.3f, %.3f, %.3f) cmd=(%d,%d)"
-                        % (kp, ki, kd, current_left_speed, current_right_speed)
+                        "[pid_learned] gain=(%.3f, %.3f, %.3f) model_cmd=(%d,%d) hw_cmd=(%d,%d)"
+                        % (kp, ki, kd, model_left_speed, model_right_speed, hw_left_speed, hw_right_speed)
                     )
                     last_log_ts = now
 
@@ -647,6 +714,17 @@ if __name__ == "__main__":
     print(f"[boot] config={args.config_path}")
     print(f"[boot] onnx={args.onnx_path}")
 
+    # Validate ONNX path before touching GPIO to avoid noisy PWM cleanup errors.
+    if args.mode in ("local_ai", "pid_learned"):
+        onnx_abs = os.path.abspath(os.path.expanduser(args.onnx_path))
+        if not os.path.isfile(onnx_abs):
+            raise FileNotFoundError(
+                "ONNX model not found: {}\nHint: check filename typo (e.g. compat vs compact) and file location.".format(
+                    onnx_abs
+                )
+            )
+        args.onnx_path = onnx_abs
+
     pwm_a, pwm_b = setup_gpio()
     try:
         if args.mode == "local_ai":
@@ -658,7 +736,4 @@ if __name__ == "__main__":
         else:
             run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps)
     finally:
-        stop_all_motors(pwm_a, pwm_b)
-        pwm_a.stop()
-        pwm_b.stop()
-        GPIO.cleanup()
+        safe_shutdown_gpio(pwm_a, pwm_b)

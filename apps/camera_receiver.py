@@ -22,6 +22,7 @@ class CameraReceiver:
         self._debug_overlay_enabled = True
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
+        self._lost_feature_hold_frames = 8
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -117,7 +118,38 @@ class CameraReceiver:
 
     def _set_latest_line_features(self, features: Dict[str, float]) -> None:
         with self._lock:
-            self._latest_line_features = features.copy()
+            incoming = features.copy()
+
+            incoming_detect_sum = (
+                float(incoming.get("line_detect_top", 0.0))
+                + float(incoming.get("line_detect_mid", 0.0))
+                + float(incoming.get("line_detect_bottom", 0.0))
+            )
+
+            # Short-term hold: if detection is lost briefly, keep the previous
+            # feature trend with decay to avoid abrupt 0,0 control on curves.
+            if incoming_detect_sum <= 0.0 and (0 < self._consecutive_misses <= self._lost_feature_hold_frames):
+                prev = self._latest_line_features.copy()
+                prev_detect_sum = (
+                    float(prev.get("line_detect_top", 0.0))
+                    + float(prev.get("line_detect_mid", 0.0))
+                    + float(prev.get("line_detect_bottom", 0.0))
+                )
+                if prev_detect_sum > 0.0:
+                    decay = 1.0 - (float(self._consecutive_misses) / float(self._lost_feature_hold_frames + 1))
+                    decay = float(np.clip(decay, 0.15, 1.0))
+                    hold_conf = float(np.clip(decay, 0.20, 1.0))
+
+                    incoming = {
+                        "line_detect_top": hold_conf,
+                        "line_detect_mid": hold_conf,
+                        "line_detect_bottom": hold_conf,
+                        "line_offset_top": float(np.clip(float(prev.get("line_offset_top", 0.0)) * decay, -1.0, 1.0)),
+                        "line_offset_mid": float(np.clip(float(prev.get("line_offset_mid", 0.0)) * decay, -1.0, 1.0)),
+                        "line_offset_bottom": float(np.clip(float(prev.get("line_offset_bottom", 0.0)) * decay, -1.0, 1.0)),
+                    }
+
+            self._latest_line_features = incoming
 
     def get_latest_line_features(self) -> Dict[str, float]:
         with self._lock:
@@ -167,13 +199,27 @@ class CameraReceiver:
 
         if far_region.size > 0:
             far_median = float(np.median(far_region))
-            far_target = int(np.clip(round(far_median * 0.82), 40, 180))
-            far_threshold = int(round((0.9 * far_threshold) + (0.1 * far_target)))
+            far_p35 = float(np.percentile(far_region, 35))
+            far_otsu, _ = cv2.threshold(far_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            far_target = max(
+                round(far_median * 0.82),
+                round(far_p35 * 0.95),
+                round(float(far_otsu) * 0.90),
+            )
+            far_target = int(np.clip(far_target, 40, 185))
+            far_threshold = int(round((0.8 * far_threshold) + (0.2 * far_target)))
 
         if near_region.size > 0:
             near_median = float(np.median(near_region))
-            near_target = int(np.clip(round(near_median * 0.76), 20, 160))
-            near_threshold = int(round((0.9 * near_threshold) + (0.1 * near_target)))
+            near_p35 = float(np.percentile(near_region, 35))
+            near_otsu, _ = cv2.threshold(near_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            near_target = max(
+                round(near_median * 0.76),
+                round(near_p35 * 0.95),
+                round(float(near_otsu) * 0.88),
+            )
+            near_target = int(np.clip(near_target, 30, 170))
+            near_threshold = int(round((0.8 * near_threshold) + (0.2 * near_target)))
 
         with self._lock:
             self._far_threshold = int(np.clip(far_threshold, 0, 255))
@@ -233,6 +279,7 @@ class CameraReceiver:
             relax_ratio = min(0.30, 0.08 * float(self._consecutive_misses))
             corridor_mask = np.zeros_like(mask, dtype=np.uint8)
             upper_safe_limit = int(roi_h * 0.78)
+            edge_lock_risk = abs(center_hint - (w * 0.5)) > (0.28 * float(w))
 
             for r in range(roi_h):
                 t = float(r) / max(1.0, float(roi_h - 1))
@@ -255,6 +302,17 @@ class CameraReceiver:
                     x2_safe = min(w, (w // 2) + safe_half)
                     if x2_safe > x1_safe:
                         corridor_mask[r, x1_safe:x2_safe] = 255
+
+                # If tracking drifts to left/right edge, keep a center rescue band
+                # on all depths to allow fast re-capture of the true line.
+                if edge_lock_risk:
+                    rescue_half_ratio = (0.26 * (1.0 - t)) + (0.18 * t)
+                    rescue_half_ratio = float(np.clip(rescue_half_ratio, 0.16, 0.30))
+                    rescue_half = int(rescue_half_ratio * float(w))
+                    x1_rescue = max(0, (w // 2) - rescue_half)
+                    x2_rescue = min(w, (w // 2) + rescue_half)
+                    if x2_rescue > x1_rescue:
+                        corridor_mask[r, x1_rescue:x2_rescue] = 255
 
             mask = cv2.bitwise_and(mask, corridor_mask)
 
@@ -305,7 +363,7 @@ class CameraReceiver:
             base_ratio = 0.18 + (0.22 * t)
             relax_ratio = min(0.10, 0.025 * float(self._consecutive_misses))
             ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.52))
-            return int(np.clip(int(ratio * float(w)), 8, 220))
+            return int(np.clip(int(ratio * float(w)), 8, 260))
 
         def contour_score(cnt: np.ndarray) -> Tuple[float, str, Dict[str, float]]:
             area = float(cv2.contourArea(cnt))
@@ -325,7 +383,7 @@ class CameraReceiver:
             meta["bw"] = float(bw)
             meta["bh"] = float(bh)
             span_ratio = float(bh) / max(1.0, float(roi_h))
-            if area < 180.0 or span_ratio < 0.10:
+            if area < 120.0 or span_ratio < 0.08:
                 return -1.0, "small", meta
 
             fill_ratio = area / max(1.0, float(bw * bh))
@@ -345,7 +403,7 @@ class CameraReceiver:
                 return -1.0, "blob_fill", meta
             if bw_ratio > 0.62 and fill_ratio > 0.35:
                 return -1.0, "blob_wide", meta
-            if avg_row_width > (mid_allowed_width * 1.55):
+            if avg_row_width > (mid_allowed_width * 1.85):
                 return -1.0, "row_wide", meta
             # タイルの目地など、細く横長で密度の低い暗線を除外
             if avg_row_width < 10.0 and fill_ratio < 0.24 and span_ratio < 0.32 and aspect < 0.95:
@@ -398,7 +456,16 @@ class CameraReceiver:
             width_ratio = float(bw) / max(1.0, float(w))
             blob_penalty = 0.65 if width_ratio > 0.82 and span_ratio < 0.55 else 1.0
 
-            score = area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty
+            # Edge-touch candidates are common false locks; keep them but score lower
+            # so non-edge line candidates can win when available.
+            edge_penalty = 1.0
+            if touch_left or touch_right:
+                edge_penalty = 0.72
+                if self._prev_center_x is not None:
+                    if abs(float(self._prev_center_x) - (w * 0.5)) > (0.30 * float(w)):
+                        edge_penalty = 0.55
+
+            score = area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty * edge_penalty
             return score, "", meta
 
         contour_entries: list[Dict[str, float | int | str]] = []
@@ -419,6 +486,64 @@ class CameraReceiver:
             scored_contours.append((float(score), idx, cnt))
 
         best_score, best_idx, target = max(scored_contours, key=lambda item: item[0])
+
+        if best_score <= 0.0:
+            # Soft-recovery fallback: when strict filters reject all contours,
+            # pick the most line-like candidate to avoid prolonged no-detection.
+            soft_best_score = -1.0
+            soft_best_idx = None
+            soft_best_cnt = None
+
+            for idx, cnt in enumerate(contours):
+                area = float(cv2.contourArea(cnt))
+                if area <= 80.0:
+                    continue
+
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                span_ratio = float(bh) / max(1.0, float(roi_h))
+                bw_ratio = float(bw) / max(1.0, float(w))
+                fill_ratio = area / max(1.0, float(bw * bh))
+
+                if span_ratio < 0.06:
+                    continue
+                if bw_ratio > 0.90 and fill_ratio > 0.40:
+                    continue
+
+                touch_left = x <= 2
+                touch_right = (x + bw) >= (w - 2)
+                if (touch_left and touch_right) and bw_ratio > 0.70:
+                    continue
+
+                cx = float(x) + (0.5 * float(bw))
+                bottom_reach = float(y + bh) / max(1.0, float(roi_h))
+                aspect = float(bh) / max(1.0, float(bw))
+
+                if self._prev_center_x is not None and self._consecutive_misses < 4:
+                    center_ref = float(self._prev_center_x)
+                else:
+                    center_ref = float(w * 0.5)
+                center_dist = abs(cx - center_ref) / max(1.0, (w * 0.5))
+                center_bonus = max(0.35, 1.0 - (0.60 * center_dist))
+
+                shape_bonus = 0.65 + (0.65 * min(span_ratio, 1.0)) + (0.20 * min(aspect / 3.0, 1.0))
+                bottom_bonus = 0.65 + (0.55 * min(bottom_reach, 1.0))
+
+                score = area * shape_bonus * bottom_bonus * center_bonus
+                if score > soft_best_score:
+                    soft_best_score = float(score)
+                    soft_best_idx = idx
+                    soft_best_cnt = cnt
+
+            if soft_best_idx is not None and soft_best_cnt is not None:
+                best_score = soft_best_score
+                best_idx = int(soft_best_idx)
+                target = soft_best_cnt
+                for entry in contour_entries:
+                    if int(entry["idx"]) == best_idx:
+                        entry["reason"] = "soft_recover"
+                        entry["score"] = float(best_score)
+                        break
+
         if debug_overlay_enabled:
             self._draw_debug_overlay(vis, roi_top, contour_entries, best_idx=best_idx)
 

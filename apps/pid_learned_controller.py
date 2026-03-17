@@ -22,6 +22,10 @@ class LearnedPIDONNXController:
         max_motor_speed: int = 100,
         stop_on_no_line: bool = True,
         steer_limit: float = 1.0,
+        no_line_hold_frames: int = 3,
+        no_line_brake_frames: int = 8,
+        gain_smoothing_alpha: float = 0.25,
+        steer_rate_limit: float = 0.18,
     ) -> None:
         if history <= 0:
             raise ValueError("history must be >= 1")
@@ -31,6 +35,10 @@ class LearnedPIDONNXController:
         self.max_motor_speed = int(max(1, max_motor_speed))
         self.stop_on_no_line = bool(stop_on_no_line)
         self.steer_limit = float(max(1e-6, abs(steer_limit)))
+        self.no_line_hold_frames = max(0, int(no_line_hold_frames))
+        self.no_line_brake_frames = max(1, int(no_line_brake_frames))
+        self.gain_smoothing_alpha = float(np.clip(gain_smoothing_alpha, 0.0, 1.0))
+        self.steer_rate_limit = float(max(1e-4, abs(steer_rate_limit)))
 
         self._net: Optional[cv2.dnn_Net] = None
         self._model_path: str = ""
@@ -38,6 +46,8 @@ class LearnedPIDONNXController:
         self._left_norm_prev: float = 0.0
         self._right_norm_prev: float = 0.0
         self._last_gains: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._no_line_frames: int = 0
+        self._last_steer: float = 0.0
 
     @property
     def model_path(self) -> str:
@@ -61,6 +71,8 @@ class LearnedPIDONNXController:
         self._left_norm_prev = 0.0
         self._right_norm_prev = 0.0
         self._last_gains = (0.0, 0.0, 0.0)
+        self._no_line_frames = 0
+        self._last_steer = 0.0
 
     def _norm_to_speed(self, left_norm: float, right_norm: float) -> Tuple[int, int]:
         left_speed = int(np.clip(np.round(left_norm * 100.0), -self.max_motor_speed, self.max_motor_speed))
@@ -107,12 +119,23 @@ class LearnedPIDONNXController:
 
     def _pid_terms_from_window(self, window_flat: np.ndarray) -> Tuple[float, float, float, float, float]:
         seq = np.asarray(window_flat, dtype=np.float32).reshape(self.history, 9)
-        detect_mid = np.clip(seq[:, 1], 0.0, 1.0)
-        offset_mid = np.clip(seq[:, 4], -1.0, 1.0)
-        effective_error = detect_mid * offset_mid
+        detect = np.clip(seq[:, 0:3], 0.0, 1.0)
+        offset = np.clip(seq[:, 3:6], -1.0, 1.0)
+        zone_weights = np.asarray([0.20, 0.35, 0.45], dtype=np.float32).reshape(1, 3)
+
+        weighted_detect = detect * zone_weights
+        weighted_sum = np.sum(weighted_detect, axis=1)
+        weighted_error_num = np.sum(weighted_detect * offset, axis=1)
+
+        effective_error = np.zeros_like(weighted_sum, dtype=np.float32)
+        valid = weighted_sum > 0.01
+        effective_error[valid] = weighted_error_num[valid] / np.maximum(weighted_sum[valid], 1e-6)
 
         error = float(effective_error[-1])
-        integral = float(np.mean(effective_error))
+        if np.any(valid):
+            integral = float(np.sum(effective_error * valid.astype(np.float32)) / max(1.0, float(np.sum(valid))))
+        else:
+            integral = 0.0
         derivative = float(effective_error[-1] - effective_error[-2]) if self.history >= 2 else 0.0
         base_speed_norm = float(np.clip(seq[-1, 8], 0.0, 1.0))
         detect_sum = float(np.sum(seq[-1, 0:3]))
@@ -141,9 +164,25 @@ class LearnedPIDONNXController:
         error, integral, derivative, base_speed_norm, detect_sum = self._pid_terms_from_window(inp.reshape(-1))
 
         if self.stop_on_no_line and detect_sum <= 0.0:
+            self._no_line_frames += 1
+            if self._no_line_frames <= self.no_line_hold_frames:
+                return self._norm_to_speed(self._left_norm_prev, self._right_norm_prev)
+
+            brake_step = self._no_line_frames - self.no_line_hold_frames
+            if brake_step <= self.no_line_brake_frames:
+                decay = 1.0 - (float(brake_step) / float(self.no_line_brake_frames))
+                decay = float(np.clip(decay, 0.0, 1.0))
+                min_decay = 0.15
+                scale = min_decay + ((1.0 - min_decay) * decay)
+                left_norm = self._left_norm_prev * scale
+                right_norm = self._right_norm_prev * scale
+                return self._norm_to_speed(left_norm, right_norm)
+
             self._left_norm_prev = 0.0
             self._right_norm_prev = 0.0
             return 0, 0
+
+        self._no_line_frames = 0
 
         self._net.setInput(inp)
         output = self._net.forward()
@@ -151,13 +190,30 @@ class LearnedPIDONNXController:
         if out.size < 3:
             raise RuntimeError(f"Unexpected ONNX output shape for PID gains: {output.shape}")
 
-        kp = float(np.clip(out[0], 0.0, 5.0))
-        ki = float(np.clip(out[1], 0.0, 5.0))
-        kd = float(np.clip(out[2], 0.0, 5.0))
+        kp_raw = float(np.clip(out[0], 0.0, 5.0))
+        ki_raw = float(np.clip(out[1], 0.0, 5.0))
+        kd_raw = float(np.clip(out[2], 0.0, 5.0))
+
+        g = self.gain_smoothing_alpha
+        kp_prev, ki_prev, kd_prev = self._last_gains
+        kp = ((1.0 - g) * kp_prev) + (g * kp_raw)
+        ki = ((1.0 - g) * ki_prev) + (g * ki_raw)
+        kd = ((1.0 - g) * kd_prev) + (g * kd_raw)
         self._last_gains = (kp, ki, kd)
 
-        steer = (kp * error) + (ki * integral) + (kd * derivative)
+        steer_target = (kp * error) + (ki * integral) + (kd * derivative)
+        steer_target = float(np.clip(steer_target, -self.steer_limit, self.steer_limit))
+
+        delta = steer_target - self._last_steer
+        max_delta = self.steer_rate_limit
+        if delta > max_delta:
+            steer = self._last_steer + max_delta
+        elif delta < -max_delta:
+            steer = self._last_steer - max_delta
+        else:
+            steer = steer_target
         steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
+        self._last_steer = steer
 
         left_norm = float(np.clip(base_speed_norm + steer, -1.0, 1.0))
         right_norm = float(np.clip(base_speed_norm - steer, -1.0, 1.0))
