@@ -439,9 +439,9 @@ class CameraReceiver:
                 result.append((float(cx), float(seg_w), x_min, x_max))
             return result
 
-        seed_center_row = int(np.clip(roi_h * 0.55, 0, roi_h - 1))
-        seed_r0 = max(0, seed_center_row - 18)
-        seed_r1 = min(roi_h, seed_center_row + 19)
+        seed_center_row = int(np.clip(roi_h * 0.60, 0, roi_h - 1))
+        seed_r0 = max(0, seed_center_row - 16)
+        seed_r1 = min(roi_h, seed_center_row + 17)
 
         best_seed = None
         best_seed_cost = float("inf")
@@ -462,11 +462,18 @@ class CameraReceiver:
 
         seed_row, seed_cx, seed_w = best_seed
 
-        def track_direction(start_row: int, step: int, start_x: float) -> tuple[list[int], list[float], list[float]]:
+        def track_direction(
+            start_row: int,
+            step: int,
+            start_x: float,
+            start_w: float,
+        ) -> tuple[list[int], list[float], list[float]]:
             rows: list[int] = []
             centers: list[float] = []
             widths: list[float] = []
             track_x = float(start_x)
+            track_w = max(8.0, float(start_w))
+            prev_dx = 0.0
             misses = 0
             max_misses = 18
 
@@ -482,10 +489,12 @@ class CameraReceiver:
                 best = None
                 best_cost = float("inf")
                 for cx, seg_w, x_min, x_max in segs:
-                    jump_cost = abs(cx - track_x)
+                    pred_x = track_x + (0.8 * prev_dx)
+                    jump_cost = abs(cx - pred_x)
+                    width_consistency_cost = abs(float(seg_w) - track_w) * 0.45
                     width_cost = max(0.0, seg_w - (0.40 * float(w))) * 0.25
                     border_penalty = 28.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
-                    cost = jump_cost + width_cost + border_penalty
+                    cost = jump_cost + width_consistency_cost + width_cost + border_penalty
                     if cost < best_cost:
                         best_cost = cost
                         best = (cx, seg_w)
@@ -497,8 +506,9 @@ class CameraReceiver:
                     continue
 
                 cx, seg_w = best
-                jump_limit = (0.18 * float(w)) + (0.8 * seg_w)
-                if abs(cx - track_x) > jump_limit:
+                delta_x = float(cx - track_x)
+                jump_limit = (0.14 * float(w)) + (0.55 * float(seg_w)) + (0.60 * abs(prev_dx))
+                if abs(delta_x) > jump_limit:
                     misses += 1
                     if misses > max_misses:
                         break
@@ -508,12 +518,14 @@ class CameraReceiver:
                 centers.append(cx)
                 widths.append(seg_w)
                 track_x = 0.75 * track_x + 0.25 * cx
+                track_w = 0.75 * track_w + 0.25 * float(seg_w)
+                prev_dx = 0.70 * prev_dx + 0.30 * delta_x
                 misses = 0
 
             return rows, centers, widths
 
-        up_rows, up_centers, up_widths = track_direction(seed_row - 1, -1, seed_cx)
-        down_rows, down_centers, down_widths = track_direction(seed_row + 1, 1, seed_cx)
+        up_rows, up_centers, up_widths = track_direction(seed_row - 1, -1, seed_cx, seed_w)
+        down_rows, down_centers, down_widths = track_direction(seed_row + 1, 1, seed_cx, seed_w)
 
         tracked_rows = [seed_row] + up_rows + down_rows
         tracked_centers = [seed_cx] + up_centers + down_centers
