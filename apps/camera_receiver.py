@@ -333,6 +333,7 @@ class CameraReceiver:
             bw_ratio = float(bw) / max(1.0, float(w))
             avg_row_width = area / max(1.0, float(bh))
             mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
+            aspect = float(bh) / max(1.0, float(bw))
 
             touch_left = x <= 2
             touch_right = (x + bw) >= (w - 2)
@@ -349,13 +350,16 @@ class CameraReceiver:
             # 画面端にべったり張り付いた太い暗領域は除外
             if (touch_left or touch_right) and bw_ratio > 0.38 and fill_ratio > 0.12 and span_ratio > 0.25:
                 return -1.0, "edge_blob", meta
+            # 画面端の細い縦スジ（パネル境界など）を除外
+            if (touch_left or touch_right) and bw_ratio < 0.08 and span_ratio > 0.25 and fill_ratio > 0.10:
+                return -1.0, "edge_strip", meta
             if (touch_left and touch_right) and bw_ratio > 0.25:
                 return -1.0, "full_span", meta
-            if (touch_top and touch_bottom) and bw_ratio > 0.20 and fill_ratio > 0.22:
+            # 上下端をまたぐ候補は、太くて塊っぽい場合のみ除外（本命ラインは通す）
+            if (touch_top and touch_bottom) and bw_ratio > 0.34 and fill_ratio > 0.30 and aspect < 2.0:
                 return -1.0, "vertical_blob", meta
 
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
-            aspect = float(bh) / max(1.0, float(bw))
             cx = float(x) + float(bw) * 0.5
 
             center_ref = self._prev_center_x if self._prev_center_x is not None else (w * 0.5)
