@@ -227,10 +227,10 @@ class CameraReceiver:
 
         mask = global_mask.copy()
 
-        # 前回中心がある場合のみ探索帯で絞る。上側は広く、下側は狭くして誤検出を抑える。
-        if self._prev_center_x is not None:
+        # 前回中心がある場合のみ探索帯で絞る。見失い時は絞りを弱めて再捕捉優先。
+        if self._prev_center_x is not None and self._consecutive_misses < 3:
             center_hint = float(np.clip(self._prev_center_x, 0.0, float(w - 1)))
-            relax_ratio = min(0.18, 0.03 * float(self._consecutive_misses))
+            relax_ratio = min(0.30, 0.08 * float(self._consecutive_misses))
             corridor_mask = np.zeros_like(mask, dtype=np.uint8)
             upper_safe_limit = int(roi_h * 0.78)
 
@@ -238,8 +238,8 @@ class CameraReceiver:
                 t = float(r) / max(1.0, float(roi_h - 1))
 
                 # メイン探索帯: 遠方(上)は広く、近傍(下)は狭く
-                main_half_ratio = (0.48 * (1.0 - t)) + (0.18 * t) + relax_ratio
-                main_half_ratio = float(np.clip(main_half_ratio, 0.12, 0.60))
+                main_half_ratio = (0.56 * (1.0 - t)) + (0.24 * t) + relax_ratio
+                main_half_ratio = float(np.clip(main_half_ratio, 0.18, 0.78))
                 main_half = int(main_half_ratio * float(w))
                 x1_main = max(0, int(center_hint) - main_half)
                 x2_main = min(w, int(center_hint) + main_half)
@@ -248,8 +248,8 @@ class CameraReceiver:
 
                 # 上側は中央寄りの安全帯も残し、大きなカーブでの取りこぼしを抑える
                 if r < upper_safe_limit:
-                    safe_half_ratio = (0.52 * (1.0 - t)) + (0.24 * t)
-                    safe_half_ratio = float(np.clip(safe_half_ratio, 0.20, 0.58))
+                    safe_half_ratio = (0.62 * (1.0 - t)) + (0.32 * t)
+                    safe_half_ratio = float(np.clip(safe_half_ratio, 0.28, 0.74))
                     safe_half = int(safe_half_ratio * float(w))
                     x1_safe = max(0, (w // 2) - safe_half)
                     x2_safe = min(w, (w // 2) + safe_half)
@@ -301,10 +301,10 @@ class CameraReceiver:
 
         def max_segment_width_px(row_index: int) -> int:
             t = float(row_index) / max(1.0, float(roi_h - 1))
-            # 巨大な暗領域を避けるため、許容幅は全体的に厳しめ
-            base_ratio = 0.14 + (0.16 * t)
-            relax_ratio = min(0.04, 0.01 * float(self._consecutive_misses))
-            ratio = float(np.clip(base_ratio + relax_ratio, 0.12, 0.36))
+            # カーブ時の幅変化を許容しつつ、巨大塊は除外
+            base_ratio = 0.18 + (0.22 * t)
+            relax_ratio = min(0.08, 0.02 * float(self._consecutive_misses))
+            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.48))
             return max(8, int(ratio * float(w)))
 
         def contour_score(cnt: np.ndarray) -> Tuple[float, str, Dict[str, float]]:
@@ -351,7 +351,7 @@ class CameraReceiver:
             if (touch_left or touch_right) and bw_ratio > 0.38 and fill_ratio > 0.12 and span_ratio > 0.25:
                 return -1.0, "edge_blob", meta
             # 画面端の細い縦スジ（パネル境界など）を除外
-            if (touch_left or touch_right) and bw_ratio < 0.08 and span_ratio > 0.25 and fill_ratio > 0.10:
+            if (touch_left or touch_right) and bw_ratio < 0.06 and span_ratio > 0.55 and fill_ratio > 0.22 and aspect > 2.8:
                 return -1.0, "edge_strip", meta
             if (touch_left and touch_right) and bw_ratio > 0.25:
                 return -1.0, "full_span", meta
@@ -439,9 +439,9 @@ class CameraReceiver:
                 result.append((float(cx), float(seg_w), x_min, x_max))
             return result
 
-        seed_center_row = int(np.clip(roi_h * 0.60, 0, roi_h - 1))
-        seed_r0 = max(0, seed_center_row - 16)
-        seed_r1 = min(roi_h, seed_center_row + 17)
+        seed_center_row = int(np.clip(roi_h * 0.52, 0, roi_h - 1))
+        seed_r0 = max(0, seed_center_row - 24)
+        seed_r1 = min(roi_h, seed_center_row + 25)
 
         best_seed = None
         best_seed_cost = float("inf")
@@ -489,9 +489,9 @@ class CameraReceiver:
                 best = None
                 best_cost = float("inf")
                 for cx, seg_w, x_min, x_max in segs:
-                    pred_x = track_x + (0.8 * prev_dx)
+                    pred_x = track_x + (0.6 * prev_dx)
                     jump_cost = abs(cx - pred_x)
-                    width_consistency_cost = abs(float(seg_w) - track_w) * 0.45
+                    width_consistency_cost = abs(float(seg_w) - track_w) * 0.25
                     width_cost = max(0.0, seg_w - (0.40 * float(w))) * 0.25
                     border_penalty = 28.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
                     cost = jump_cost + width_consistency_cost + width_cost + border_penalty
@@ -507,7 +507,7 @@ class CameraReceiver:
 
                 cx, seg_w = best
                 delta_x = float(cx - track_x)
-                jump_limit = (0.14 * float(w)) + (0.55 * float(seg_w)) + (0.60 * abs(prev_dx))
+                jump_limit = (0.18 * float(w)) + (0.80 * float(seg_w)) + (1.20 * abs(prev_dx))
                 if abs(delta_x) > jump_limit:
                     misses += 1
                     if misses > max_misses:
@@ -519,7 +519,7 @@ class CameraReceiver:
                 widths.append(seg_w)
                 track_x = 0.75 * track_x + 0.25 * cx
                 track_w = 0.75 * track_w + 0.25 * float(seg_w)
-                prev_dx = 0.70 * prev_dx + 0.30 * delta_x
+                prev_dx = 0.60 * prev_dx + 0.40 * delta_x
                 misses = 0
 
             return rows, centers, widths
