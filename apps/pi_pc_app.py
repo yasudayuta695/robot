@@ -88,6 +88,7 @@ class UnifiedApp:
             smoothing_alpha=0.55,
             max_motor_speed=100,
             stop_on_no_line=True,
+            curve_slowdown_sensitivity=self.config.curve_slowdown_sensitivity,
         )
         self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
         self._ai_error_logged = False
@@ -232,6 +233,15 @@ class UnifiedApp:
         self.near_threshold_scale.pack(side=tk.LEFT)
         self.near_threshold_value_label = tk.Label(self.threshold_frame, text=str(near_threshold), width=4)
         self.near_threshold_value_label.pack(side=tk.LEFT)
+
+        self.auto_threshold_var = tk.BooleanVar(value=self.camera_receiver.is_auto_threshold_enabled())
+        self.auto_threshold_check = tk.Checkbutton(
+            self.threshold_frame,
+            text="閾値自動補正",
+            variable=self.auto_threshold_var,
+            command=self.on_toggle_auto_threshold,
+        )
+        self.auto_threshold_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
@@ -394,6 +404,14 @@ class UnifiedApp:
     def on_near_threshold_change(self, _value: str) -> None:
         _, near = self.camera_receiver.set_thresholds(near_threshold=int(self.near_threshold_var.get()))
         self.near_threshold_value_label.config(text=str(near))
+
+    def on_toggle_auto_threshold(self) -> None:
+        enabled = self.camera_receiver.set_auto_threshold_enabled(bool(self.auto_threshold_var.get()))
+        self.auto_threshold_var.set(enabled)
+        if enabled:
+            self.logger.info("黒ライン閾値の自動補正: ON")
+        else:
+            self.logger.info("黒ライン閾値の自動補正: OFF")
 
     def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
         self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
@@ -662,6 +680,13 @@ class UnifiedApp:
         display_src = line_vis if line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
         line_features = self.camera_receiver.get_latest_line_features()
+        far_now, near_now = self.camera_receiver.get_thresholds()
+        if int(self.far_threshold_var.get()) != far_now:
+            self.far_threshold_var.set(far_now)
+            self.far_threshold_value_label.config(text=str(far_now))
+        if int(self.near_threshold_var.get()) != near_now:
+            self.near_threshold_var.set(near_now)
+            self.near_threshold_value_label.config(text=str(near_now))
 
         if self.control_mode.get() == "ai":
             self.run_ai_control(line_features)

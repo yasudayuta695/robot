@@ -59,8 +59,10 @@ Run from project root or from `robot_MLP/`.
 
 ```bash
 python /home/cr7_yas97/ss2025robot/robot_MLP/train.py \
-  --csv-path /path/to/driving_log.csv \
-  --epochs 40 \
+  --csv-path /home/cr7_yas97/ss2025robot/dataset/camera_1 ^
+  --holdout-unit hour ^
+  --split-report-path /home/cr7_yas97/ss2025robot/dataset_split.json ^
+  --epochs 80 \
   --batch-size 64 \
   --lr 1e-3 \
   --history 10 \
@@ -122,6 +124,8 @@ Session split behavior (implemented):
 
 ```bash
 python /home/cr7_yas97/ss2025robot/robot_MLP/test.py \
+  --split-report-path /home/cr7_yas97/ss2025robot/dataset_split.json ^
+  --split-name test ^
   --csv-path /path/to/test_driving_log.csv \
   --weights-path /home/cr7_yas97/ss2025robot/robot_MLP/model.pt \
   --history 10 \

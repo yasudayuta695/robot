@@ -10,6 +10,8 @@ drive_speed_default=60
 # 十字キー速度の比率（drive_speed_defaultに対する倍率）
 dpad_drive_speed_scale=1.0
 dpad_turn_speed_scale=0.4
+# カーブ時の自動減速感度（0.0:無効、推奨0.4〜1.0）
+curve_slowdown_sensitivity=0.70
 
 # カメラ選択肢
 camera_id=camera_1

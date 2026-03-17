@@ -18,6 +18,7 @@ class CameraReceiver:
         self._latest_line_features = self._default_line_features()
         self._far_threshold = 100
         self._near_threshold = 70
+        self._auto_threshold_enabled = False
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._running = False
@@ -58,12 +59,48 @@ class CameraReceiver:
         with self._lock:
             return self._far_threshold, self._near_threshold
 
+    def is_auto_threshold_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._auto_threshold_enabled)
+
+    def set_auto_threshold_enabled(self, enabled: bool) -> bool:
+        with self._lock:
+            self._auto_threshold_enabled = bool(enabled)
+            return self._auto_threshold_enabled
+
     def set_thresholds(self, far_threshold: Optional[int] = None, near_threshold: Optional[int] = None) -> Tuple[int, int]:
         with self._lock:
             if far_threshold is not None:
                 self._far_threshold = int(np.clip(int(far_threshold), 0, 255))
             if near_threshold is not None:
                 self._near_threshold = int(np.clip(int(near_threshold), 0, 255))
+            return self._far_threshold, self._near_threshold
+
+    def _resolve_thresholds(self, blur: np.ndarray, far_split: int) -> Tuple[int, int]:
+        with self._lock:
+            far_threshold = int(self._far_threshold)
+            near_threshold = int(self._near_threshold)
+            auto_enabled = bool(self._auto_threshold_enabled)
+
+        if not auto_enabled:
+            return far_threshold, near_threshold
+
+        far_region = blur[:far_split, :]
+        near_region = blur[far_split:, :]
+
+        if far_region.size > 0:
+            far_median = float(np.median(far_region))
+            far_target = int(np.clip(round(far_median * 0.82), 40, 180))
+            far_threshold = int(round((0.9 * far_threshold) + (0.1 * far_target)))
+
+        if near_region.size > 0:
+            near_median = float(np.median(near_region))
+            near_target = int(np.clip(round(near_median * 0.76), 20, 160))
+            near_threshold = int(round((0.9 * near_threshold) + (0.1 * near_target)))
+
+        with self._lock:
+            self._far_threshold = int(np.clip(far_threshold, 0, 255))
+            self._near_threshold = int(np.clip(near_threshold, 0, 255))
             return self._far_threshold, self._near_threshold
 
     def start(self) -> None:
@@ -101,7 +138,7 @@ class CameraReceiver:
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
-        far_threshold, near_threshold = self.get_thresholds()
+        far_threshold, near_threshold = self._resolve_thresholds(blur=blur, far_split=far_split)
 
         _, mask_far = cv2.threshold(blur[:far_split, :], far_threshold, 255, cv2.THRESH_BINARY_INV)
         _, mask_near = cv2.threshold(blur[far_split:, :], near_threshold, 255, cv2.THRESH_BINARY_INV)
