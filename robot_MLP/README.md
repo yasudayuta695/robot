@@ -52,15 +52,15 @@ pip install torch numpy matplotlib onnx onnxscript
 
 ## 4. 学習（VS Code統合ターミナル）
 
-以下はワークスペースルート（`Robot_car/`）で実行する想定です。
+以下は `robot_MLP/` ディレクトリで実行する想定です。
 
 ### Linux / WSL (bash)
 
 ```bash
-python robot_MLP/train.py \
-  --csv-path dataset/camera_1 \
+python train.py \
+  --csv-path ../dataset/camera_1 \
   --holdout-unit hour \
-  --split-report-path dataset_split.json \
+  --split-report-path ../dataset_split.json \
   --epochs 80 \
   --batch-size 64 \
   --lr 1e-3 \
@@ -70,9 +70,9 @@ python robot_MLP/train.py \
   --early-stopping \
   --patience 10 \
   --min-delta 1e-4 \
-  --weights-path robot_MLP/model.pt \
-  --onnx-path robot_MLP/model.onnx \
-  --curve-path robot_MLP/learning_curve.png
+  --weights-path model.pt \
+  --onnx-path model.onnx \
+  --curve-path learning_curve.png
 ```
 
 ### Windows PowerShell
@@ -119,26 +119,26 @@ python robot_MLP/train.py `
 ### 全CSVを対象に評価
 
 ```bash
-python robot_MLP/test.py \
-  --csv-path dataset/camera_1 \
-  --weights-path robot_MLP/model.pt \
+python test.py \
+  --csv-path ../dataset/camera_1 \
+  --weights-path model.pt \
   --history 10 \
   --hidden1 64 \
   --hidden2 32 \
-  --pred-csv-path robot_MLP/test_predictions.csv
+  --pred-csv-path test_predictions.csv
 ```
 
 ### 推奨: holdoutされたtest splitで評価
 
 ```bash
-python robot_MLP/test.py \
-  --split-report-path dataset_split.json \
+python test.py \
+  --split-report-path ../dataset_split.json \
   --split-name test \
-  --weights-path robot_MLP/model.pt \
+  --weights-path model.pt \
   --history 10 \
   --hidden1 64 \
   --hidden2 32 \
-  --pred-csv-path robot_MLP/test_predictions.csv
+  --pred-csv-path test_predictions.csv
 ```
 
 出力指標:
