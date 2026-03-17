@@ -3,7 +3,7 @@
 # Linux例: save_base_dir=/home/ryuryu/lab/Robot_car
 # UNC例: save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
 
-save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car\
+save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\cr7_yas97\ss2025robot\datasets
 
 # 速度基準（UI初期値）
 drive_speed_default=60
@@ -12,6 +12,18 @@ dpad_drive_speed_scale=1.0
 dpad_turn_speed_scale=0.4
 # カーブ時の自動減速感度（0.0:無効、推奨0.4〜1.0）
 curve_slowdown_sensitivity=0.70
+# 推論出力の平滑化（0.0:無効 / 1.0:強い追従）
+ai_smoothing_alpha=0.35
+# ライン見失い時の保持フレーム数（長いほど復帰が遅くなる）
+ai_no_line_hold_frames=3
+# ライン見失い後の減速に使うフレーム数
+ai_no_line_brake_frames=8
+# ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
+line_process_interval_ms=70
+# AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
+ai_control_interval_ms=100
+# UI更新周期(ms)
+ui_update_interval_ms=30
 
 # カメラ選択肢
 camera_id=camera_1

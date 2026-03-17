@@ -1,8 +1,9 @@
 import logging
 import os
 import tkinter as tk
+import time
 import cv2
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Dict, List, Set, Tuple
 
 from PIL import Image, ImageTk
@@ -35,6 +36,7 @@ INNER_SPEED_SCALE = 0.9
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
+DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
 
 
@@ -85,11 +87,20 @@ class UnifiedApp:
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
         self.ai_controller = LineTraceONNXController(
             history=10,
-            smoothing_alpha=0.55,
+            smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             stop_on_no_line=True,
             curve_slowdown_sensitivity=self.config.curve_slowdown_sensitivity,
+            no_line_hold_frames=self.config.ai_no_line_hold_frames,
+            no_line_brake_frames=self.config.ai_no_line_brake_frames,
         )
+        self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
+        self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
+        self.ui_update_interval_ms = max(10, int(self.config.ui_update_interval_ms))
+        self._last_line_process_time = 0.0
+        self._last_ai_control_time = 0.0
+        self._cached_line_vis = None
+        self._cached_line_features = self.camera_receiver.get_latest_line_features()
         self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
         self._ai_error_logged = False
 
@@ -457,7 +468,18 @@ class UnifiedApp:
 
     def toggle_recording(self) -> None:
         if self.recorder.state == RecorderState.IDLE:
-            self.recorder.arm()
+            try:
+                self.recorder.arm()
+            except Exception as exc:
+                save_root = to_wsl_unc_path(self.config.save_base_dir, self.wsl_distro_name)
+                self.logger.exception("録画待機への切替に失敗しました。save_base_dir=%s", save_root)
+                messagebox.showerror(
+                    "録画開始エラー",
+                    "録画開始の準備に失敗しました。\n"
+                    f"保存先: {save_root}\n"
+                    f"詳細: {exc}",
+                )
+                return
             self.record_btn.config(text="■ 録画待機中", bg="khaki")
             self.logger.info("録画待機中: 操作入力を待っています。")
             return
@@ -580,6 +602,8 @@ class UnifiedApp:
         self.active_dirs.clear()
         self.send_command(0, 0)
         self.reset_ai_state()
+        self._last_ai_control_time = 0.0
+        self._last_line_process_time = 0.0
         self.canvas.coords(
             self.stick,
             CENTER - STICK_RADIUS,
@@ -669,6 +693,7 @@ class UnifiedApp:
     def reset_ai_state(self) -> None:
         self.ai_controller.reset_state()
         self._ai_error_logged = False
+        self._last_ai_control_time = 0.0
 
     def run_ai_control(self, line_features: Dict[str, float]) -> None:
         if not self.ai_controller.is_loaded():
@@ -692,11 +717,21 @@ class UnifiedApp:
 
     def update_camera_frame(self) -> None:
         frame = self.camera_receiver.get_latest_frame()
+        now = time.perf_counter()
 
-        line_vis = self.camera_receiver.find_line(frame)
-        display_src = line_vis if line_vis is not None else frame
+        should_process_line = (
+            self._cached_line_vis is None
+            or (now - self._last_line_process_time) >= self.line_process_interval_sec
+        )
+        if should_process_line:
+            line_vis = self.camera_receiver.find_line(frame)
+            self._cached_line_vis = line_vis if line_vis is not None else frame
+            self._cached_line_features = self.camera_receiver.get_latest_line_features()
+            self._last_line_process_time = now
+
+        display_src = self._cached_line_vis if self._cached_line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
-        line_features = self.camera_receiver.get_latest_line_features()
+        line_features = self._cached_line_features.copy()
         far_now, near_now = self.camera_receiver.get_thresholds()
         if int(self.far_threshold_var.get()) != far_now:
             self.far_threshold_var.set(far_now)
@@ -706,7 +741,9 @@ class UnifiedApp:
             self.near_threshold_value_label.config(text=str(near_now))
 
         if self.control_mode.get() == "ai":
-            self.run_ai_control(line_features)
+            if (now - self._last_ai_control_time) >= self.ai_control_interval_sec:
+                self.run_ai_control(line_features)
+                self._last_ai_control_time = now
         
         pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
@@ -721,10 +758,10 @@ class UnifiedApp:
             drive_type=self.drive_type_var.get(),
             drive_speed_base=self.get_drive_speed(),
             control_mode=self.control_mode.get(),
-            interval_sec=0.1,
+            interval_sec=DATA_RECORD_INTERVAL_SEC,
         )
 
-        self.root.after(30, self.update_camera_frame)
+        self.root.after(self.ui_update_interval_ms, self.update_camera_frame)
 
     def send_command(self, left_speed: int, right_speed: int) -> None:
         if self.emergency_stop_active:

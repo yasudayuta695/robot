@@ -57,23 +57,31 @@ class DataRecorder:
         self.last_target_right_norm = 0.0
 
     def arm(self) -> None:
-        if os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir)
-        os.makedirs(self.temp_img_dir, exist_ok=True)
+        try:
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+            os.makedirs(self.temp_img_dir, exist_ok=True)
 
-        self.csv_file = open(self.temp_csv_path, mode="w", newline="")
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(self.CSV_HEADER)
+            self.csv_file = open(self.temp_csv_path, mode="w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(self.CSV_HEADER)
 
-        self.state = RecorderState.ARMED
-        self.last_save_time = 0.0
-        self.recording_session_id = ""
-        self.frame_sequence = 0
-        self.output_folder_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.recording_started_at = None
-        self.recording_stopped_at = None
-        self.last_target_left_norm = 0.0
-        self.last_target_right_norm = 0.0
+            self.state = RecorderState.ARMED
+            self.last_save_time = 0.0
+            self.recording_session_id = ""
+            self.frame_sequence = 0
+            self.output_folder_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            self.recording_started_at = None
+            self.recording_stopped_at = None
+            self.last_target_left_norm = 0.0
+            self.last_target_right_norm = 0.0
+        except Exception:
+            if self.csv_file:
+                self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+            self.state = RecorderState.IDLE
+            raise
 
     def start_recording_if_needed(self, left_speed: int, right_speed: int) -> bool:
         if self.state == RecorderState.ARMED and (left_speed != 0 or right_speed != 0):
