@@ -144,8 +144,9 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None
         sock.setsockopt(zmq.CONFLATE, 1)
         sock.bind(f"tcp://*:{CAMERA_PORT}")
 
+        print("[remote] Initializing camera...")
         picam2 = Picamera2()
-        config = picam2.create_still_configuration(main={"size": (320, 240)})
+        config = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
         picam2.configure(config)
         picam2.start()
         picam2.set_controls(
@@ -158,7 +159,7 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None
         )
 
         sleep_sec = max(0.0, 1.0 / max(1e-6, camera_fps))
-        print("Camera stream thread started in remote mode...")
+        print("[remote] Camera stream thread started.")
         try:
             while running:
                 img = picam2.capture_array()
@@ -178,7 +179,7 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     socket.bind(f"tcp://*:{MOTOR_PORT}")
-    print("Remote motor command server started...")
+    print("[remote] Motor command server started.")
 
     try:
         while running:
@@ -204,11 +205,13 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
     logger = logging.getLogger("pi_local_ai")
     logger.setLevel(logging.INFO)
 
+    print(f"[local_ai] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
 
     onnx_path = os.path.abspath(os.path.expanduser(args.onnx_path))
     if not os.path.isfile(onnx_path):
         raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+    print(f"[local_ai] ONNX found: {onnx_path}")
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
@@ -227,7 +230,9 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
         no_line_hold_frames=int(runtime_cfg.ai_no_line_hold_frames),
         no_line_brake_frames=int(runtime_cfg.ai_no_line_brake_frames),
     )
+    print("[local_ai] Loading ONNX model...")
     ai_controller.load_model(onnx_path)
+    print("[local_ai] ONNX model loaded.")
 
     control_interval_sec = max(0.02, float(runtime_cfg.ai_control_interval_ms) / 1000.0)
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
@@ -239,8 +244,9 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
     last_line_ts = 0.0
     cached_features = line_detector.get_latest_line_features()
 
+    print("[local_ai] Initializing camera...")
     picam2 = Picamera2()
-    cam_conf = picam2.create_still_configuration(main={"size": (320, 240)})
+    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
     picam2.configure(cam_conf)
     picam2.start()
     picam2.set_controls(
@@ -252,7 +258,7 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
         }
     )
 
-    print("Local AI mode started on Pi.")
+    print("[local_ai] Started.")
     print(f"ONNX={onnx_path}")
     print(
         "intervals: line={}ms control={}ms camera_fps={}".format(
@@ -310,7 +316,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-fps", type=float, default=30.0)
     parser.add_argument("--exposure-time", type=int, default=5000)
     parser.add_argument("--analogue-gain", type=float, default=1.0)
-    parser.add_argument("--stop-on-no-line", action=argparse.BooleanOptionalAction, default=True)
+    bool_action = getattr(argparse, "BooleanOptionalAction", None)
+    if bool_action is not None:
+        parser.add_argument("--stop-on-no-line", action=bool_action, default=True)
+    else:
+        # Python 3.8 compatibility on older Raspberry Pi OS images.
+        parser.add_argument("--stop-on-no-line", dest="stop_on_no_line", action="store_true", default=True)
+        parser.add_argument("--no-stop-on-no-line", dest="stop_on_no_line", action="store_false")
     return parser
 
 
@@ -322,6 +334,10 @@ if __name__ == "__main__":
         args.config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "comfig.txt"))
     if not args.onnx_path:
         args.onnx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "robot_MLP", "model.onnx"))
+
+    print(f"[boot] mode={args.mode}")
+    print(f"[boot] config={args.config_path}")
+    print(f"[boot] onnx={args.onnx_path}")
 
     pwm_a, pwm_b = setup_gpio()
     try:
