@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from train import DrivingLogSequenceDataset, LineTraceMLP, resolve_csv_paths
+from train import DrivingLogSequenceDataset, LineTraceMLP, PIDGainMLP, motor_from_gains, resolve_csv_paths
 
 
 def load_csv_paths_from_split_report(split_report_path: str, split_name: str) -> List[str]:
@@ -35,20 +35,29 @@ def load_csv_paths_from_split_report(split_report_path: str, split_name: str) ->
 
 
 def evaluate_model(
-    model: LineTraceMLP,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[dict, np.ndarray, np.ndarray]:
+    target_mode: str,
+    history: int,
+    steer_limit: float,
+) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
 
     preds: List[np.ndarray] = []
     targets: List[np.ndarray] = []
+    gains_all: List[np.ndarray] = []
 
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            pred = model(x)
+            if target_mode == "pid-gain":
+                gains = model(x)
+                pred = motor_from_gains(gains, x=x, history=history, steer_limit=steer_limit)
+                gains_all.append(gains.detach().cpu().numpy())
+            else:
+                pred = model(x)
 
             preds.append(pred.detach().cpu().numpy())
             targets.append(y.detach().cpu().numpy())
@@ -87,13 +96,24 @@ def evaluate_model(
         "rmse_left": rmse_left,
         "rmse_right": rmse_right,
     }
-    return metrics, pred_arr, target_arr
+    if len(gains_all) > 0:
+        gain_arr = np.concatenate(gains_all, axis=0).astype(np.float32)
+        metrics.update(
+            {
+                "kp_mean": float(np.mean(gain_arr[:, 0])),
+                "ki_mean": float(np.mean(gain_arr[:, 1])),
+                "kd_mean": float(np.mean(gain_arr[:, 2])),
+            }
+        )
+    else:
+        gain_arr = np.empty((0, 3), dtype=np.float32)
+    return metrics, pred_arr, target_arr, gain_arr
 
 
-def save_predictions_csv(path: str, preds: np.ndarray, targets: np.ndarray) -> None:
+def save_predictions_csv(path: str, preds: np.ndarray, targets: np.ndarray, gains: np.ndarray) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        header = [
             "index",
             "pred_left",
             "pred_right",
@@ -101,11 +121,15 @@ def save_predictions_csv(path: str, preds: np.ndarray, targets: np.ndarray) -> N
             "target_right",
             "abs_err_left",
             "abs_err_right",
-        ])
+        ]
+        has_gain = gains.size > 0 and gains.shape[0] == preds.shape[0]
+        if has_gain:
+            header.extend(["kp", "ki", "kd"])
+        writer.writerow(header)
 
         abs_err = np.abs(preds - targets)
         for i in range(preds.shape[0]):
-            writer.writerow([
+            row = [
                 i,
                 float(preds[i, 0]),
                 float(preds[i, 1]),
@@ -113,7 +137,10 @@ def save_predictions_csv(path: str, preds: np.ndarray, targets: np.ndarray) -> N
                 float(targets[i, 1]),
                 float(abs_err[i, 0]),
                 float(abs_err[i, 1]),
-            ])
+            ]
+            if has_gain:
+                row.extend([float(gains[i, 0]), float(gains[i, 1]), float(gains[i, 2])])
+            writer.writerow(row)
 
     print(f"Saved prediction details: {path}")
 
@@ -127,11 +154,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to one test driving_log.csv file OR a directory containing multiple session folders",
     )
     parser.add_argument("--weights-path", type=str, required=True, help="Path to trained model .pt (state_dict)")
+    parser.add_argument("--onnx-path", type=str, default="", help="Optional ONNX path (accepted for workflow compatibility; not used in this script)")
     parser.add_argument("--split-report-path", type=str, default="", help="Optional dataset split JSON from train.py")
     parser.add_argument("--split-name", type=str, default="test", choices=["train", "val", "test"], help="Which split to evaluate when split report is provided")
     parser.add_argument("--history", type=int, default=10, help="Frame history length used during training")
     parser.add_argument("--hidden1", type=int, default=64, help="Hidden layer size 1 (must match training)")
     parser.add_argument("--hidden2", type=int, default=32, help="Hidden layer size 2 (must match training)")
+    parser.add_argument("--target-mode", type=str, default="pid-gain", choices=["motor", "pid-gain"], help="Evaluation mode matching train.py")
+    parser.add_argument("--kp-max", type=float, default=2.5, help="Must match train.py when target-mode=pid-gain")
+    parser.add_argument("--ki-max", type=float, default=1.0, help="Must match train.py when target-mode=pid-gain")
+    parser.add_argument("--kd-max", type=float, default=1.5, help="Must match train.py when target-mode=pid-gain")
+    parser.add_argument("--steer-limit", type=float, default=1.0, help="Steering clamp used for pid-gain evaluation")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="", help='e.g. "cpu" or "cuda". Empty means auto.')
@@ -140,6 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(args: argparse.Namespace) -> None:
+    if args.onnx_path:
+        print(f"[Info] --onnx-path is provided but ignored by test.py (PyTorch .pt evaluation): {args.onnx_path}")
+
     if args.split_report_path:
         csv_paths = load_csv_paths_from_split_report(args.split_report_path, args.split_name)
         print(f"Using split report: split={args.split_name}, csvs={len(csv_paths)}")
@@ -161,12 +197,29 @@ def main(args: argparse.Namespace) -> None:
         drop_last=False,
     )
 
-    model = LineTraceMLP(input_dim=input_dim, hidden1=args.hidden1, hidden2=args.hidden2, output_dim=2)
+    if args.target_mode == "pid-gain":
+        model = PIDGainMLP(
+            input_dim=input_dim,
+            hidden1=args.hidden1,
+            hidden2=args.hidden2,
+            kp_max=args.kp_max,
+            ki_max=args.ki_max,
+            kd_max=args.kd_max,
+        )
+    else:
+        model = LineTraceMLP(input_dim=input_dim, hidden1=args.hidden1, hidden2=args.hidden2, output_dim=2)
     state_dict = torch.load(args.weights_path, map_location="cpu")
     model.load_state_dict(state_dict)
     model = model.to(device)
 
-    metrics, preds, targets = evaluate_model(model, loader, device)
+    metrics, preds, targets, gains = evaluate_model(
+        model=model,
+        loader=loader,
+        device=device,
+        target_mode=args.target_mode,
+        history=args.history,
+        steer_limit=args.steer_limit,
+    )
 
     print("=== Test Metrics ===")
     print(f"samples    : {metrics['num_samples']}")
@@ -179,9 +232,13 @@ def main(args: argparse.Namespace) -> None:
     print(f"RMSE       : {metrics['rmse']:.6f}")
     print(f"RMSE(left) : {metrics['rmse_left']:.6f}")
     print(f"RMSE(right): {metrics['rmse_right']:.6f}")
+    if args.target_mode == "pid-gain":
+        print(f"Kp(mean)   : {metrics['kp_mean']:.6f}")
+        print(f"Ki(mean)   : {metrics['ki_mean']:.6f}")
+        print(f"Kd(mean)   : {metrics['kd_mean']:.6f}")
 
     if args.pred_csv_path:
-        save_predictions_csv(args.pred_csv_path, preds, targets)
+        save_predictions_csv(args.pred_csv_path, preds, targets, gains)
 
 
 if __name__ == "__main__":

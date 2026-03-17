@@ -25,6 +25,17 @@ ai_control_interval_ms=100
 # UI更新周期(ms)
 ui_update_interval_ms=30
 
+# PID制御ゲイン（--mode pid で使用）
+pid_kp=0.95
+pid_ki=0.08
+pid_kd=0.22
+# PID出力の上限（操舵量）
+pid_output_limit=1.0
+# 積分項の上限（windup対策）
+pid_integral_limit=1.5
+# ライン未検出時に停止するか
+pid_stop_on_no_line=true
+
 # カメラ選択肢
 camera_id=camera_1
 camera_id=camera_2

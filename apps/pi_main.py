@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -13,6 +14,7 @@ from picamera2 import Picamera2
 
 from ai_controller import LineTraceONNXController
 from camera_receiver import CameraReceiver
+from pid_learned_controller import LearnedPIDONNXController
 
 
 # Network ports used by legacy remote mode.
@@ -32,7 +34,7 @@ MA_IN1, MA_IN2, MA_PWM = 19, 21, 23
 MB_IN1, MB_IN2, MB_PWM = 15, 13, 11
 
 
-def setup_gpio() -> tuple[GPIO.PWM, GPIO.PWM]:
+def setup_gpio() -> Tuple[GPIO.PWM, GPIO.PWM]:
     GPIO.setmode(GPIO.BOARD)
     for pin in [MA_IN1, MA_IN2, MA_PWM, MB_IN1, MB_IN2, MB_PWM]:
         GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
@@ -87,6 +89,79 @@ class PiRuntimeConfig:
     ai_control_interval_ms: int = 100
     far_threshold: int = 100
     near_threshold: int = 70
+    pid_kp: float = 0.95
+    pid_ki: float = 0.08
+    pid_kd: float = 0.22
+    pid_output_limit: float = 1.0
+    pid_integral_limit: float = 1.5
+    pid_stop_on_no_line: bool = True
+
+
+def _parse_bool(text: str) -> Optional[bool]:
+    lowered = text.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+class PIDController:
+    def __init__(
+        self,
+        kp: float,
+        ki: float,
+        kd: float,
+        output_limit: float,
+        integral_limit: float,
+    ) -> None:
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.output_limit = float(max(1e-6, abs(output_limit)))
+        self.integral_limit = float(max(0.0, abs(integral_limit)))
+        self.integral = 0.0
+        self.prev_error: Optional[float] = None
+
+    def reset(self) -> None:
+        self.integral = 0.0
+        self.prev_error = None
+
+    def update(self, error: float, dt: float) -> float:
+        dt = max(1e-4, float(dt))
+        self.integral += float(error) * dt
+        self.integral = float(np.clip(self.integral, -self.integral_limit, self.integral_limit))
+
+        derivative = 0.0
+        if self.prev_error is not None:
+            derivative = (float(error) - float(self.prev_error)) / dt
+        self.prev_error = float(error)
+
+        out = (self.kp * float(error)) + (self.ki * self.integral) + (self.kd * derivative)
+        return float(np.clip(out, -self.output_limit, self.output_limit))
+
+
+def _extract_pid_error(line_features: dict) -> Optional[float]:
+    # Near zone gets the highest weight because it is most relevant for immediate steering.
+    weights = [
+        ("line_detect_top", "line_offset_top", 0.20),
+        ("line_detect_mid", "line_offset_mid", 0.35),
+        ("line_detect_bottom", "line_offset_bottom", 0.45),
+    ]
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for detect_key, offset_key, weight in weights:
+        detected = float(line_features.get(detect_key, 0.0))
+        if detected <= 0.0:
+            continue
+        offset = float(np.clip(line_features.get(offset_key, 0.0), -1.0, 1.0))
+        weighted_sum += weight * offset
+        weight_total += weight
+
+    if weight_total <= 0.0:
+        return None
+    return float(np.clip(weighted_sum / weight_total, -1.0, 1.0))
 
 
 def load_runtime_config(config_path: str) -> PiRuntimeConfig:
@@ -120,6 +195,20 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
                     cfg.far_threshold = int(float(value))
                 elif key == "near_threshold":
                     cfg.near_threshold = int(float(value))
+                elif key == "pid_kp":
+                    cfg.pid_kp = float(value)
+                elif key == "pid_ki":
+                    cfg.pid_ki = float(value)
+                elif key == "pid_kd":
+                    cfg.pid_kd = float(value)
+                elif key == "pid_output_limit":
+                    cfg.pid_output_limit = float(value)
+                elif key == "pid_integral_limit":
+                    cfg.pid_integral_limit = float(value)
+                elif key == "pid_stop_on_no_line":
+                    parsed = _parse_bool(value)
+                    if parsed is not None:
+                        cfg.pid_stop_on_no_line = parsed
             except ValueError:
                 continue
 
@@ -131,7 +220,120 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
     cfg.ai_control_interval_ms = int(np.clip(cfg.ai_control_interval_ms, 20, 300))
     cfg.far_threshold = int(np.clip(cfg.far_threshold, 0, 255))
     cfg.near_threshold = int(np.clip(cfg.near_threshold, 0, 255))
+    cfg.pid_output_limit = float(np.clip(cfg.pid_output_limit, 0.05, 2.5))
+    cfg.pid_integral_limit = float(np.clip(cfg.pid_integral_limit, 0.0, 10.0))
     return cfg
+
+
+def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> None:
+    logger = logging.getLogger("pi_pid")
+    logger.setLevel(logging.INFO)
+
+    print(f"[pid] Loading runtime config: {args.config_path}")
+    runtime_cfg = load_runtime_config(args.config_path)
+
+    line_detector = CameraReceiver("127.0.0.1", 0, logger)
+    line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_auto_threshold_enabled(False)
+    line_detector.set_thresholds(
+        far_threshold=int(runtime_cfg.far_threshold),
+        near_threshold=int(runtime_cfg.near_threshold),
+    )
+
+    kp = float(runtime_cfg.pid_kp if args.pid_kp is None else args.pid_kp)
+    ki = float(runtime_cfg.pid_ki if args.pid_ki is None else args.pid_ki)
+    kd = float(runtime_cfg.pid_kd if args.pid_kd is None else args.pid_kd)
+    output_limit = float(runtime_cfg.pid_output_limit)
+    integral_limit = float(runtime_cfg.pid_integral_limit)
+    stop_on_no_line = bool(runtime_cfg.pid_stop_on_no_line)
+
+    pid = PIDController(
+        kp=kp,
+        ki=ki,
+        kd=kd,
+        output_limit=output_limit,
+        integral_limit=integral_limit,
+    )
+
+    control_interval_sec = max(0.02, float(runtime_cfg.ai_control_interval_ms) / 1000.0)
+    line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
+    camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
+
+    last_control_ts = time.perf_counter()
+    last_line_ts = 0.0
+    last_log_ts = 0.0
+    cached_features = line_detector.get_latest_line_features()
+
+    print("[pid] Initializing camera...")
+    picam2 = Picamera2()
+    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+    picam2.configure(cam_conf)
+    picam2.start()
+    picam2.set_controls(
+        {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": int(args.exposure_time),
+            "AnalogueGain": float(args.analogue_gain),
+        }
+    )
+
+    print("[pid] Started.")
+    print(f"[pid] gains: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f}")
+    print(
+        "[pid] intervals: line={}ms control={}ms camera_fps={}".format(
+            int(runtime_cfg.line_process_interval_ms),
+            int(runtime_cfg.ai_control_interval_ms),
+            float(args.camera_fps),
+        )
+    )
+
+    try:
+        while True:
+            now = time.perf_counter()
+            frame_rgb = picam2.capture_array()
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
+
+            if (now - last_line_ts) >= line_interval_sec:
+                line_detector.find_line(frame_bgr)
+                cached_features = line_detector.get_latest_line_features()
+                last_line_ts = now
+
+            if (now - last_control_ts) >= control_interval_sec:
+                dt = now - last_control_ts
+                last_control_ts = now
+
+                error = _extract_pid_error(cached_features)
+                if error is None and stop_on_no_line:
+                    pid.reset()
+                    cmd_left = 0
+                    cmd_right = 0
+                else:
+                    if error is None:
+                        error = 0.0
+                    steer = pid.update(error=error, dt=dt)
+                    turn = int(np.round(steer * float(args.base_speed)))
+                    left = int(np.clip(int(args.base_speed) + turn, -100, 100))
+                    right = int(np.clip(int(args.base_speed) - turn, -100, 100))
+                    cmd_left = int(np.clip(left * MOTOR_LEFT_SIGN, -100, 100))
+                    cmd_right = int(np.clip(right * MOTOR_RIGHT_SIGN, -100, 100))
+
+                set_left_motor(cmd_left, pwm_b)
+                set_right_motor(cmd_right, pwm_a)
+
+                if (now - last_log_ts) >= 1.0:
+                    e_disp = "None" if error is None else f"{float(error):+.3f}"
+                    print(f"[pid] err={e_disp} cmd=({cmd_left},{cmd_right})")
+                    last_log_ts = now
+
+            if camera_sleep_sec > 0.0:
+                time.sleep(camera_sleep_sec)
+    except KeyboardInterrupt:
+        print("Stopping pid mode...")
+    finally:
+        stop_all_motors(pwm_a, pwm_b)
+        picam2.stop()
 
 
 def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None:
@@ -305,9 +507,112 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
         picam2.stop()
 
 
+def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> None:
+    logger = logging.getLogger("pi_pid_learned")
+    logger.setLevel(logging.INFO)
+
+    print(f"[pid_learned] Loading runtime config: {args.config_path}")
+    runtime_cfg = load_runtime_config(args.config_path)
+
+    onnx_path = os.path.abspath(os.path.expanduser(args.onnx_path))
+    if not os.path.isfile(onnx_path):
+        raise FileNotFoundError(f"PID-gain ONNX model not found: {onnx_path}")
+
+    line_detector = CameraReceiver("127.0.0.1", 0, logger)
+    line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_auto_threshold_enabled(False)
+    line_detector.set_thresholds(
+        far_threshold=int(runtime_cfg.far_threshold),
+        near_threshold=int(runtime_cfg.near_threshold),
+    )
+
+    controller = LearnedPIDONNXController(
+        history=int(args.history),
+        smoothing_alpha=float(runtime_cfg.ai_smoothing_alpha),
+        max_motor_speed=int(args.max_motor_speed),
+        stop_on_no_line=bool(runtime_cfg.pid_stop_on_no_line),
+        steer_limit=float(runtime_cfg.pid_output_limit),
+    )
+    print("[pid_learned] Loading ONNX model...")
+    controller.load_model(onnx_path)
+    print("[pid_learned] ONNX model loaded.")
+
+    control_interval_sec = max(0.02, float(runtime_cfg.ai_control_interval_ms) / 1000.0)
+    line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
+    camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
+
+    current_left_speed = 0
+    current_right_speed = 0
+    last_control_ts = 0.0
+    last_line_ts = 0.0
+    last_log_ts = 0.0
+    cached_features = line_detector.get_latest_line_features()
+
+    print("[pid_learned] Initializing camera...")
+    picam2 = Picamera2()
+    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+    picam2.configure(cam_conf)
+    picam2.start()
+    picam2.set_controls(
+        {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": int(args.exposure_time),
+            "AnalogueGain": float(args.analogue_gain),
+        }
+    )
+
+    print("[pid_learned] Started.")
+    print(f"[pid_learned] ONNX={onnx_path}")
+
+    try:
+        while True:
+            now = time.perf_counter()
+
+            frame_rgb = picam2.capture_array()
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
+
+            if (now - last_line_ts) >= line_interval_sec:
+                line_detector.find_line(frame_bgr)
+                cached_features = line_detector.get_latest_line_features()
+                last_line_ts = now
+
+            if (now - last_control_ts) >= control_interval_sec:
+                left_speed, right_speed = controller.predict_motor_speed(
+                    line_features=cached_features,
+                    current_left_speed=current_left_speed,
+                    current_right_speed=current_right_speed,
+                    base_speed=int(args.base_speed),
+                )
+
+                current_left_speed = int(np.clip(left_speed * MOTOR_LEFT_SIGN, -100, 100))
+                current_right_speed = int(np.clip(right_speed * MOTOR_RIGHT_SIGN, -100, 100))
+
+                set_left_motor(current_left_speed, pwm_b)
+                set_right_motor(current_right_speed, pwm_a)
+                last_control_ts = now
+
+                if (now - last_log_ts) >= 1.0:
+                    kp, ki, kd = controller.last_gains
+                    print(
+                        "[pid_learned] gain=(%.3f, %.3f, %.3f) cmd=(%d,%d)"
+                        % (kp, ki, kd, current_left_speed, current_right_speed)
+                    )
+                    last_log_ts = now
+
+            if camera_sleep_sec > 0.0:
+                time.sleep(camera_sleep_sec)
+    except KeyboardInterrupt:
+        print("Stopping pid_learned mode...")
+    finally:
+        stop_all_motors(pwm_a, pwm_b)
+        picam2.stop()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi runtime for robot car (remote or local AI mode)")
-    parser.add_argument("--mode", type=str, default="remote", choices=["remote", "local_ai"])
+    parser.add_argument("--mode", type=str, default="remote", choices=["remote", "local_ai", "pid", "pid_learned"])
     parser.add_argument("--config-path", type=str, default="")
     parser.add_argument("--onnx-path", type=str, default="")
     parser.add_argument("--history", type=int, default=10)
@@ -316,6 +621,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-fps", type=float, default=30.0)
     parser.add_argument("--exposure-time", type=int, default=5000)
     parser.add_argument("--analogue-gain", type=float, default=1.0)
+    parser.add_argument("--pid-kp", type=float, default=None)
+    parser.add_argument("--pid-ki", type=float, default=None)
+    parser.add_argument("--pid-kd", type=float, default=None)
     bool_action = getattr(argparse, "BooleanOptionalAction", None)
     if bool_action is not None:
         parser.add_argument("--stop-on-no-line", action=bool_action, default=True)
@@ -343,6 +651,10 @@ if __name__ == "__main__":
     try:
         if args.mode == "local_ai":
             run_local_ai_mode(args, pwm_a, pwm_b)
+        elif args.mode == "pid":
+            run_pid_mode(args, pwm_a, pwm_b)
+        elif args.mode == "pid_learned":
+            run_pid_learned_mode(args, pwm_a, pwm_b)
         else:
             run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps)
     finally:

@@ -60,7 +60,25 @@ def resolve_csv_paths(csv_path: str) -> List[str]:
     if not csv_path:
         raise ValueError("csv_path is empty")
 
-    norm_path = os.path.abspath(os.path.expanduser(csv_path))
+    raw_path = os.path.expanduser(csv_path)
+    norm_path = os.path.abspath(raw_path)
+
+    # Convenience fallback: when running from robot_MLP/, allow paths written
+    # relative to the project root (e.g. ./dataset/camera_2).
+    candidate_paths = [norm_path]
+    if not os.path.isabs(raw_path):
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        raw_rel = raw_path[2:] if raw_path.startswith("./") else raw_path
+        candidate_paths.append(os.path.abspath(os.path.join(project_root, raw_rel)))
+
+    resolved_path = ""
+    for candidate in candidate_paths:
+        if os.path.isfile(candidate) or os.path.isdir(candidate):
+            resolved_path = candidate
+            break
+
+    if resolved_path:
+        norm_path = resolved_path
 
     if os.path.isfile(norm_path):
         return [norm_path]
@@ -75,7 +93,11 @@ def resolve_csv_paths(csv_path: str) -> List[str]:
             raise ValueError(f"No driving_log.csv found under directory: {norm_path}")
         return collected
 
-    raise ValueError(f"csv path does not exist: {csv_path}")
+    msg = [f"csv path does not exist: {csv_path}"]
+    msg.append("Checked paths:")
+    msg.extend([f"- {p}" for p in dict.fromkeys(candidate_paths)])
+    msg.append("Hint: from robot_MLP/, dataset is usually ../dataset/<camera_id>")
+    raise ValueError("\n".join(msg))
 
 
 def infer_session_and_type(csv_file: str) -> Tuple[str, str]:
@@ -289,6 +311,76 @@ class LineTraceMLP(nn.Module):
         return self.net(x)
 
 
+class PIDGainMLP(nn.Module):
+    """Predict bounded PID gains [kp, ki, kd] from flattened sequence input."""
+
+    def __init__(
+        self,
+        input_dim: int = 90,
+        hidden1: int = 64,
+        hidden2: int = 32,
+        kp_max: float = 2.5,
+        ki_max: float = 1.0,
+        kd_max: float = 1.5,
+    ) -> None:
+        super().__init__()
+        self.kp_max = float(max(1e-6, kp_max))
+        self.ki_max = float(max(1e-6, ki_max))
+        self.kd_max = float(max(1e-6, kd_max))
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Linear(hidden2, 3),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self.net(x)
+        kp = torch.sigmoid(raw[:, 0]) * self.kp_max
+        ki = torch.sigmoid(raw[:, 1]) * self.ki_max
+        kd = torch.sigmoid(raw[:, 2]) * self.kd_max
+        return torch.stack([kp, ki, kd], dim=1)
+
+
+def pid_terms_from_input(x: torch.Tensor, history: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    frame_dim = len(FEATURE_COLUMNS)
+    if x.dim() != 2:
+        raise ValueError(f"Expected 2D tensor, got shape={tuple(x.shape)}")
+    if x.size(1) != history * frame_dim:
+        raise ValueError(f"Input feature size mismatch: got {x.size(1)}, expected {history * frame_dim}")
+
+    seq = x.view(x.size(0), history, frame_dim)
+    detect_mid = torch.clamp(seq[:, :, 1], 0.0, 1.0)
+    offset_mid = torch.clamp(seq[:, :, 4], -1.0, 1.0)
+    effective_error = detect_mid * offset_mid
+
+    error = effective_error[:, -1]
+    integral = torch.mean(effective_error, dim=1)
+    if history >= 2:
+        derivative = effective_error[:, -1] - effective_error[:, -2]
+    else:
+        derivative = torch.zeros_like(error)
+    base_speed_norm = torch.clamp(seq[:, -1, 8], 0.0, 1.0)
+    return error, integral, derivative, base_speed_norm
+
+
+def motor_from_gains(gains: torch.Tensor, x: torch.Tensor, history: int, steer_limit: float) -> torch.Tensor:
+    if gains.dim() != 2 or gains.size(1) != 3:
+        raise ValueError(f"Expected gain tensor shape=(N,3), got {tuple(gains.shape)}")
+
+    error, integral, derivative, base_speed_norm = pid_terms_from_input(x, history=history)
+    kp = gains[:, 0]
+    ki = gains[:, 1]
+    kd = gains[:, 2]
+
+    steer = (kp * error) + (ki * integral) + (kd * derivative)
+    steer = torch.clamp(steer, -abs(float(steer_limit)), abs(float(steer_limit)))
+    left = torch.clamp(base_speed_norm + steer, -1.0, 1.0)
+    right = torch.clamp(base_speed_norm - steer, -1.0, 1.0)
+    return torch.stack([left, right], dim=1)
+
+
 def split_indices_sequential(n_total: int, val_ratio: float) -> tuple[Sequence[int], Sequence[int]]:
     if not (0.0 <= val_ratio < 1.0):
         raise ValueError("val_ratio must be in [0.0, 1.0)")
@@ -302,7 +394,16 @@ def split_indices_sequential(n_total: int, val_ratio: float) -> tuple[Sequence[i
     return train_indices, val_indices
 
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    target_mode: str,
+    history: int,
+    steer_limit: float,
+    gain_l2: float,
+) -> float:
     model.eval()
     total_loss = 0.0
     total_count = 0
@@ -310,8 +411,15 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            pred = model(x)
-            loss = criterion(pred, y)
+            if target_mode == "pid-gain":
+                gains = model(x)
+                pred = motor_from_gains(gains, x=x, history=history, steer_limit=steer_limit)
+                loss = criterion(pred, y)
+                if gain_l2 > 0.0:
+                    loss = loss + (gain_l2 * torch.mean(gains * gains))
+            else:
+                pred = model(x)
+                loss = criterion(pred, y)
             bsz = x.size(0)
             total_loss += loss.item() * bsz
             total_count += bsz
@@ -424,7 +532,17 @@ def train(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    model = LineTraceMLP(input_dim=input_dim, hidden1=args.hidden1, hidden2=args.hidden2, output_dim=2).to(device)
+    if args.target_mode == "pid-gain":
+        model = PIDGainMLP(
+            input_dim=input_dim,
+            hidden1=args.hidden1,
+            hidden2=args.hidden2,
+            kp_max=args.kp_max,
+            ki_max=args.ki_max,
+            kd_max=args.kd_max,
+        ).to(device)
+    else:
+        model = LineTraceMLP(input_dim=input_dim, hidden1=args.hidden1, hidden2=args.hidden2, output_dim=2).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -448,8 +566,15 @@ def train(args: argparse.Namespace) -> None:
             y = y.to(device)
 
             optimizer.zero_grad()
-            pred = model(x)
-            loss = criterion(pred, y)
+            if args.target_mode == "pid-gain":
+                gains = model(x)
+                pred = motor_from_gains(gains, x=x, history=args.history, steer_limit=args.steer_limit)
+                loss = criterion(pred, y)
+                if args.gain_l2 > 0.0:
+                    loss = loss + (args.gain_l2 * torch.mean(gains * gains))
+            else:
+                pred = model(x)
+                loss = criterion(pred, y)
             loss.backward()
             optimizer.step()
 
@@ -461,7 +586,16 @@ def train(args: argparse.Namespace) -> None:
         train_losses.append(train_loss)
 
         if use_validation:
-            val_loss = evaluate(model, val_loader, criterion, device)
+            val_loss = evaluate(
+                model=model,
+                loader=val_loader,
+                criterion=criterion,
+                device=device,
+                target_mode=args.target_mode,
+                history=args.history,
+                steer_limit=args.steer_limit,
+                gain_l2=args.gain_l2,
+            )
             val_losses.append(val_loss)
 
             improved = val_loss < (best_val_loss - args.min_delta)
@@ -504,8 +638,11 @@ def train(args: argparse.Namespace) -> None:
         opset_version=13,
         do_constant_folding=True,
         input_names=["input"],
-        output_names=["motor_output"],
-        dynamic_axes={"input": {0: "batch"}, "motor_output": {0: "batch"}},
+        output_names=["pid_gains" if args.target_mode == "pid-gain" else "motor_output"],
+        dynamic_axes={
+            "input": {0: "batch"},
+            ("pid_gains" if args.target_mode == "pid-gain" else "motor_output"): {0: "batch"},
+        },
     )
     try:
         # Prefer legacy exporter to avoid hard dependency on onnxscript.
@@ -529,7 +666,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train MLP for line-trace motor output regression and export ONNX.")
+    parser = argparse.ArgumentParser(description="Train MLP for line-trace (motor regression or PID-gain learning) and export ONNX.")
     parser.add_argument(
         "--csv-path",
         type=str,
@@ -551,6 +688,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="", help='e.g. "cpu" or "cuda". Empty means auto.')
     parser.add_argument("--weights-path", type=str, default="model.pt")
     parser.add_argument("--onnx-path", type=str, default="model.onnx")
+    parser.add_argument("--target-mode", type=str, default="pid-gain", choices=["motor", "pid-gain"], help="Training target: direct motor output or learned PID gains")
+    parser.add_argument("--kp-max", type=float, default=2.5, help="Upper bound for learned Kp when target-mode=pid-gain")
+    parser.add_argument("--ki-max", type=float, default=1.0, help="Upper bound for learned Ki when target-mode=pid-gain")
+    parser.add_argument("--kd-max", type=float, default=1.5, help="Upper bound for learned Kd when target-mode=pid-gain")
+    parser.add_argument("--steer-limit", type=float, default=1.0, help="Clamp limit of PID steering term when target-mode=pid-gain")
+    parser.add_argument("--gain-l2", type=float, default=1e-4, help="L2 regularization weight applied to learned gains when target-mode=pid-gain")
     parser.add_argument("--early-stopping", action="store_true", help="Enable early stopping with validation loss")
     parser.add_argument("--patience", type=int, default=8, help="Epochs to wait for val improvement before stopping")
     parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum val-loss improvement to reset patience")
