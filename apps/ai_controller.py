@@ -21,6 +21,10 @@ class LineTraceONNXController:
         smoothing_alpha: float = 0.5,
         max_motor_speed: int = 100,
         stop_on_no_line: bool = True,
+        curve_slowdown_sensitivity: float = 0.7,
+        curve_slowdown_min_scale: float = 0.45,
+        no_line_hold_frames: int = 10,
+        no_line_brake_frames: int = 20,
     ) -> None:
         if history <= 0:
             raise ValueError("history must be >= 1")
@@ -28,12 +32,17 @@ class LineTraceONNXController:
         self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
         self.max_motor_speed = int(max(1, max_motor_speed))
         self.stop_on_no_line = bool(stop_on_no_line)
+        self.curve_slowdown_sensitivity = float(np.clip(curve_slowdown_sensitivity, 0.0, 2.0))
+        self.curve_slowdown_min_scale = float(np.clip(curve_slowdown_min_scale, 0.05, 1.0))
+        self.no_line_hold_frames = max(0, int(no_line_hold_frames))
+        self.no_line_brake_frames = max(1, int(no_line_brake_frames))
 
         self._net: Optional[cv2.dnn_Net] = None
         self._model_path: str = ""
         self._feature_history: Deque[np.ndarray] = deque(maxlen=self.history)
         self._left_norm_prev: float = 0.0
         self._right_norm_prev: float = 0.0
+        self._no_line_frames: int = 0
 
     @property
     def model_path(self) -> str:
@@ -52,6 +61,12 @@ class LineTraceONNXController:
         self._feature_history.clear()
         self._left_norm_prev = 0.0
         self._right_norm_prev = 0.0
+        self._no_line_frames = 0
+
+    def _norm_to_speed(self, left_norm: float, right_norm: float) -> Tuple[int, int]:
+        left_speed = int(np.clip(np.round(left_norm * 100.0), -self.max_motor_speed, self.max_motor_speed))
+        right_speed = int(np.clip(np.round(right_norm * 100.0), -self.max_motor_speed, self.max_motor_speed))
+        return left_speed, right_speed
 
     def _make_frame_feature(
         self,
@@ -115,9 +130,25 @@ class LineTraceONNXController:
             + float(line_features.get("line_detect_bottom", 0.0))
         )
         if self.stop_on_no_line and line_detect_sum <= 0.0:
+            self._no_line_frames += 1
+            if self._no_line_frames <= self.no_line_hold_frames:
+                return self._norm_to_speed(self._left_norm_prev, self._right_norm_prev)
+
+            brake_step = self._no_line_frames - self.no_line_hold_frames
+            if brake_step <= self.no_line_brake_frames:
+                decay = 1.0 - (float(brake_step) / float(self.no_line_brake_frames))
+                decay = float(np.clip(decay, 0.0, 1.0))
+                min_decay = 0.15
+                scale = min_decay + ((1.0 - min_decay) * decay)
+                left_norm = self._left_norm_prev * scale
+                right_norm = self._right_norm_prev * scale
+                return self._norm_to_speed(left_norm, right_norm)
+
             self._left_norm_prev = 0.0
             self._right_norm_prev = 0.0
             return 0, 0
+
+        self._no_line_frames = 0
 
         inp = self._build_window_input()
         self._net.setInput(inp)
@@ -130,12 +161,18 @@ class LineTraceONNXController:
         left_norm = float(np.clip(out[0], -1.0, 1.0))
         right_norm = float(np.clip(out[1], -1.0, 1.0))
 
+        # Curve-aware slow-down: reduce speed when far/near offsets diverge.
+        top_offset = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
+        bottom_offset = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
+        curvature = abs(top_offset - bottom_offset)
+        slowdown = 1.0 - (self.curve_slowdown_sensitivity * curvature)
+        slowdown = float(np.clip(slowdown, self.curve_slowdown_min_scale, 1.0))
+        left_norm *= slowdown
+        right_norm *= slowdown
+
         a = self.smoothing_alpha
         left_norm_smooth = (1.0 - a) * self._left_norm_prev + a * left_norm
         right_norm_smooth = (1.0 - a) * self._right_norm_prev + a * right_norm
         self._left_norm_prev = left_norm_smooth
         self._right_norm_prev = right_norm_smooth
-
-        left_speed = int(np.clip(np.round(left_norm_smooth * 100.0), -self.max_motor_speed, self.max_motor_speed))
-        right_speed = int(np.clip(np.round(right_norm_smooth * 100.0), -self.max_motor_speed, self.max_motor_speed))
-        return left_speed, right_speed
+        return self._norm_to_speed(left_norm_smooth, right_norm_smooth)

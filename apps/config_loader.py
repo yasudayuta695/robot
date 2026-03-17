@@ -14,6 +14,7 @@ class AppConfig:
     drive_speed_default: int
     dpad_drive_speed_scale: float
     dpad_turn_speed_scale: float
+    curve_slowdown_sensitivity: float
     camera_ids: List[str]
     default_camera_id: str
 
@@ -28,6 +29,7 @@ def ensure_config_file(config_path: str, project_dir: str) -> None:
         f.write("drive_speed_default=60\n")
         f.write("dpad_drive_speed_scale=1.0\n")
         f.write("dpad_turn_speed_scale=0.5\n")
+        f.write("curve_slowdown_sensitivity=0.70\n")
         f.write("camera_id=camera_1\n")
         f.write("camera_id=camera_2\n")
         f.write("default_camera_id=camera_1\n")
@@ -55,6 +57,7 @@ def load_config(
     configured_drive_speed = default_drive_speed
     configured_dpad_drive_scale = default_dpad_drive_scale
     configured_dpad_turn_scale = default_dpad_turn_scale
+    configured_curve_slowdown_sensitivity = 0.70
     configured_camera_ids: List[str] = []
     configured_default_camera_id = ""
     drive_types: List[str] = []
@@ -86,6 +89,11 @@ def load_config(
                         configured_dpad_turn_scale = float(value)
                     except ValueError:
                         logger.warning("Invalid dpad_turn_speed_scale: %s", value)
+                elif key == "curve_slowdown_sensitivity" and value:
+                    try:
+                        configured_curve_slowdown_sensitivity = float(value)
+                    except ValueError:
+                        logger.warning("Invalid curve_slowdown_sensitivity: %s", value)
                 elif key == "camera_id" and value:
                     configured_camera_ids.append(value)
                 elif key == "default_camera_id" and value:
@@ -114,6 +122,8 @@ def load_config(
         logger.warning("dpad_turn_speed_scale must be positive. fallback=%s", default_dpad_turn_scale)
         configured_dpad_turn_scale = default_dpad_turn_scale
 
+    configured_curve_slowdown_sensitivity = max(0.0, min(2.0, float(configured_curve_slowdown_sensitivity)))
+
     if not configured_camera_ids:
         configured_camera_ids = ["camera_1", "camera_2"]
         logger.warning("No camera_id found in config; fallback to default camera list.")
@@ -127,6 +137,7 @@ def load_config(
         drive_speed_default=configured_drive_speed,
         dpad_drive_speed_scale=configured_dpad_drive_scale,
         dpad_turn_speed_scale=configured_dpad_turn_scale,
+        curve_slowdown_sensitivity=configured_curve_slowdown_sensitivity,
         camera_ids=configured_camera_ids,
         default_camera_id=configured_default_camera_id,
     )
