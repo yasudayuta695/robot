@@ -19,10 +19,78 @@ class CameraReceiver:
         self._far_threshold = 100
         self._near_threshold = 70
         self._auto_threshold_enabled = False
+        self._debug_overlay_enabled = True
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def _draw_debug_overlay(
+        self,
+        vis: np.ndarray,
+        roi_top: int,
+        entries: list[Dict[str, float | int | str]],
+        best_idx: Optional[int],
+    ) -> None:
+        if not entries:
+            cv2.putText(
+                vis,
+                "dbg: no contours",
+                (10, 68),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            return
+
+        sorted_entries = sorted(entries, key=lambda e: float(e["score"]), reverse=True)
+        top_entries = sorted_entries[:8]
+
+        for rank, entry in enumerate(top_entries):
+            idx = int(entry["idx"])
+            x = int(entry["x"])
+            y = int(entry["y"]) + roi_top
+            bw = int(entry["bw"])
+            bh = int(entry["bh"])
+            score = float(entry["score"])
+            reason = str(entry["reason"])
+
+            if best_idx is not None and idx == best_idx and score > 0.0:
+                color = (0, 220, 0)
+            elif score > 0.0:
+                color = (0, 170, 255)
+            else:
+                color = (0, 0, 255)
+
+            cv2.rectangle(vis, (x, y), (x + bw, y + bh), color, 1)
+
+            reason_text = reason if reason else "ok"
+            label = f"c{idx} s={score:.0f} {reason_text}"
+            text_y = max(14, y - 4)
+            cv2.putText(
+                vis,
+                label,
+                (max(2, x), text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        best_score = float(sorted_entries[0]["score"])
+        cv2.putText(
+            vis,
+            f"dbg contours={len(entries)} best={best_score:.0f}",
+            (10, 86),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (40, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
 
     def _on_detection_lost(self) -> None:
         self._consecutive_misses += 1
@@ -67,6 +135,15 @@ class CameraReceiver:
         with self._lock:
             self._auto_threshold_enabled = bool(enabled)
             return self._auto_threshold_enabled
+
+    def is_debug_overlay_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._debug_overlay_enabled)
+
+    def set_debug_overlay_enabled(self, enabled: bool) -> bool:
+        with self._lock:
+            self._debug_overlay_enabled = bool(enabled)
+            return self._debug_overlay_enabled
 
     def set_thresholds(self, far_threshold: Optional[int] = None, near_threshold: Optional[int] = None) -> Tuple[int, int]:
         with self._lock:
@@ -124,6 +201,7 @@ class CameraReceiver:
         vis = img.copy()
         h, w = vis.shape[:2]
         features = self._default_line_features()
+        debug_overlay_enabled = self.is_debug_overlay_enabled()
 
         # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
         roi_top = int(h * 0.03)
@@ -215,6 +293,8 @@ class CameraReceiver:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            if debug_overlay_enabled:
+                self._draw_debug_overlay(vis, roi_top, [], best_idx=None)
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -227,16 +307,29 @@ class CameraReceiver:
             ratio = float(np.clip(base_ratio + relax_ratio, 0.12, 0.36))
             return max(8, int(ratio * float(w)))
 
-        def contour_score(cnt: np.ndarray) -> float:
+        def contour_score(cnt: np.ndarray) -> Tuple[float, str, Dict[str, float]]:
             area = float(cv2.contourArea(cnt))
+            meta: Dict[str, float] = {
+                "area": area,
+                "x": 0.0,
+                "y": 0.0,
+                "bw": 0.0,
+                "bh": 0.0,
+                "fill_ratio": 0.0,
+            }
             if area <= 0.0:
-                return -1.0
+                return -1.0, "area0", meta
             x, y, bw, bh = cv2.boundingRect(cnt)
+            meta["x"] = float(x)
+            meta["y"] = float(y)
+            meta["bw"] = float(bw)
+            meta["bh"] = float(bh)
             span_ratio = float(bh) / max(1.0, float(roi_h))
             if area < 180.0 or span_ratio < 0.10:
-                return -1.0
+                return -1.0, "small", meta
 
             fill_ratio = area / max(1.0, float(bw * bh))
+            meta["fill_ratio"] = fill_ratio
             bw_ratio = float(bw) / max(1.0, float(w))
             avg_row_width = area / max(1.0, float(bh))
             mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
@@ -248,18 +341,18 @@ class CameraReceiver:
 
             # 線ではなく塊になった暗領域を除外
             if fill_ratio > 0.72 and (float(bh) / max(1.0, float(bw))) < 2.0:
-                return -1.0
+                return -1.0, "blob_fill", meta
             if bw_ratio > 0.62 and fill_ratio > 0.35:
-                return -1.0
+                return -1.0, "blob_wide", meta
             if avg_row_width > (mid_allowed_width * 1.25):
-                return -1.0
+                return -1.0, "row_wide", meta
             # 画面端にべったり張り付いた太い暗領域は除外
             if (touch_left or touch_right) and bw_ratio > 0.38 and fill_ratio > 0.12 and span_ratio > 0.25:
-                return -1.0
+                return -1.0, "edge_blob", meta
             if (touch_left and touch_right) and bw_ratio > 0.25:
-                return -1.0
+                return -1.0, "full_span", meta
             if (touch_top and touch_bottom) and bw_ratio > 0.20 and fill_ratio > 0.22:
-                return -1.0
+                return -1.0, "vertical_blob", meta
 
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
             aspect = float(bh) / max(1.0, float(bw))
@@ -277,10 +370,30 @@ class CameraReceiver:
             width_ratio = float(bw) / max(1.0, float(w))
             blob_penalty = 0.65 if width_ratio > 0.82 and span_ratio < 0.55 else 1.0
 
-            return area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty
+            score = area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty
+            return score, "", meta
 
-        scored_contours = [(contour_score(cnt), cnt) for cnt in contours]
-        best_score, target = max(scored_contours, key=lambda item: item[0])
+        contour_entries: list[Dict[str, float | int | str]] = []
+        scored_contours = []
+        for idx, cnt in enumerate(contours):
+            score, reason, meta = contour_score(cnt)
+            contour_entries.append(
+                {
+                    "idx": idx,
+                    "score": float(score),
+                    "reason": reason,
+                    "x": float(meta.get("x", 0.0)),
+                    "y": float(meta.get("y", 0.0)),
+                    "bw": float(meta.get("bw", 0.0)),
+                    "bh": float(meta.get("bh", 0.0)),
+                }
+            )
+            scored_contours.append((float(score), idx, cnt))
+
+        best_score, best_idx, target = max(scored_contours, key=lambda item: item[0])
+        if debug_overlay_enabled:
+            self._draw_debug_overlay(vis, roi_top, contour_entries, best_idx=best_idx)
+
         if best_score <= 0.0 or cv2.contourArea(target) <= 220:
             self._on_detection_lost()
             self._set_latest_line_features(features)

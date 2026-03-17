@@ -243,6 +243,15 @@ class UnifiedApp:
         )
         self.auto_threshold_check.pack(side=tk.LEFT, padx=(12, 0))
 
+        self.debug_overlay_var = tk.BooleanVar(value=self.camera_receiver.is_debug_overlay_enabled())
+        self.debug_overlay_check = tk.Checkbutton(
+            self.threshold_frame,
+            text="Debug Overlay",
+            variable=self.debug_overlay_var,
+            command=self.on_toggle_debug_overlay,
+        )
+        self.debug_overlay_check.pack(side=tk.LEFT, padx=(12, 0))
+
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
@@ -412,6 +421,14 @@ class UnifiedApp:
             self.logger.info("黒ライン閾値の自動補正: ON")
         else:
             self.logger.info("黒ライン閾値の自動補正: OFF")
+
+    def on_toggle_debug_overlay(self) -> None:
+        enabled = self.camera_receiver.set_debug_overlay_enabled(bool(self.debug_overlay_var.get()))
+        self.debug_overlay_var.set(enabled)
+        if enabled:
+            self.logger.info("Debug Overlay: ON")
+        else:
+            self.logger.info("Debug Overlay: OFF")
 
     def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
         self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
