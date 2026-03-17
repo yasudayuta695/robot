@@ -103,11 +103,9 @@ class PIDGainMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raw = self.net(x)
-        # Bound gains to practical ranges for stable runtime usage.
-        kp = torch.sigmoid(raw[:, 0]) * self.kp_max
-        ki = torch.sigmoid(raw[:, 1]) * self.ki_max
-        kd = torch.sigmoid(raw[:, 2]) * self.kd_max
-        return torch.stack([kp, ki, kd], dim=1)
+        # Avoid index-based gather ops to keep ONNX compatible with OpenCV DNN.
+        scales = raw.new_tensor([self.kp_max, self.ki_max, self.kd_max])
+        return torch.sigmoid(raw) * scales
 
 
 def evaluate(
@@ -299,7 +297,6 @@ def train(args: argparse.Namespace) -> None:
         do_constant_folding=True,
         input_names=["input"],
         output_names=["pid_gains"],
-        dynamic_axes={"input": {0: "batch"}, "pid_gains": {0: "batch"}},
     )
     try:
         torch.onnx.export(model_cpu, dummy, args.onnx_path, dynamo=False, **export_kwargs)
