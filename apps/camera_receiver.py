@@ -341,39 +341,38 @@ class CameraReceiver:
         if self._prev_center_x is not None and self._consecutive_misses < 3:
             center_hint = float(np.clip(self._prev_center_x * 0.5, 0.0, float(proc_w - 1)))
             relax_ratio = min(0.30, 0.08 * float(self._consecutive_misses))
-            corridor_mask = np.zeros_like(mask, dtype=np.uint8)
             upper_safe_limit = int(roi_h * 0.78)
             edge_lock_risk = abs(center_hint - (proc_w * 0.5)) > (0.28 * float(proc_w))
 
-            for r in range(roi_h):
-                t = float(r) / max(1.0, float(roi_h - 1))
-                main_half_ratio = (0.56 * (1.0 - t)) + (0.24 * t) + relax_ratio
-                main_half_ratio = float(np.clip(main_half_ratio, 0.18, 0.78))
-                main_half = int(main_half_ratio * float(proc_w))
-                x1_main = max(0, int(center_hint) - main_half)
-                x2_main = min(proc_w, int(center_hint) + main_half)
-                if x2_main > x1_main:
-                    corridor_mask[r, x1_main:x2_main] = 255
+            # 全行の t を一括計算
+            rows = np.arange(roi_h, dtype=np.float64)
+            t = rows / max(1.0, float(roi_h - 1))
+            cols = np.arange(proc_w, dtype=np.float64)
 
-                if r < upper_safe_limit:
-                    safe_half_ratio = (0.62 * (1.0 - t)) + (0.32 * t)
-                    safe_half_ratio = float(np.clip(safe_half_ratio, 0.28, 0.74))
-                    safe_half = int(safe_half_ratio * float(proc_w))
-                    x1_safe = max(0, (proc_w // 2) - safe_half)
-                    x2_safe = min(proc_w, (proc_w // 2) + safe_half)
-                    if x2_safe > x1_safe:
-                        corridor_mask[r, x1_safe:x2_safe] = 255
+            # main帯: center_hint 中心で幅が行ごとに変わる
+            main_half = np.clip((0.56 * (1.0 - t) + 0.24 * t + relax_ratio), 0.18, 0.78) * float(proc_w)
+            x1_main = np.clip(center_hint - main_half, 0, proc_w).astype(np.int32)
+            x2_main = np.clip(center_hint + main_half, 0, proc_w).astype(np.int32)
+            # cols[None, :] >= x1[:, None] でブロードキャスト比較 → bool マスク
+            corridor_mask = ((cols[None, :] >= x1_main[:, None]) & (cols[None, :] < x2_main[:, None]))
 
-                if edge_lock_risk:
-                    rescue_half_ratio = (0.26 * (1.0 - t)) + (0.18 * t)
-                    rescue_half_ratio = float(np.clip(rescue_half_ratio, 0.16, 0.30))
-                    rescue_half = int(rescue_half_ratio * float(proc_w))
-                    x1_rescue = max(0, (proc_w // 2) - rescue_half)
-                    x2_rescue = min(proc_w, (proc_w // 2) + rescue_half)
-                    if x2_rescue > x1_rescue:
-                        corridor_mask[r, x1_rescue:x2_rescue] = 255
+            # safe帯: 画面中心基準、upper_safe_limit行まで
+            safe_half = np.clip((0.62 * (1.0 - t) + 0.32 * t), 0.28, 0.74) * float(proc_w)
+            center_mid = float(proc_w // 2)
+            x1_safe = np.clip(center_mid - safe_half, 0, proc_w).astype(np.int32)
+            x2_safe = np.clip(center_mid + safe_half, 0, proc_w).astype(np.int32)
+            safe_band = ((cols[None, :] >= x1_safe[:, None]) & (cols[None, :] < x2_safe[:, None]))
+            safe_band[upper_safe_limit:, :] = False
+            corridor_mask |= safe_band
 
-            mask = cv2.bitwise_and(mask, corridor_mask)
+            # rescue帯: edge_lock_risk時のみ、画面中心基準
+            if edge_lock_risk:
+                rescue_half = np.clip((0.26 * (1.0 - t) + 0.18 * t), 0.16, 0.30) * float(proc_w)
+                x1_rescue = np.clip(center_mid - rescue_half, 0, proc_w).astype(np.int32)
+                x2_rescue = np.clip(center_mid + rescue_half, 0, proc_w).astype(np.int32)
+                corridor_mask |= ((cols[None, :] >= x1_rescue[:, None]) & (cols[None, :] < x2_rescue[:, None]))
+
+            mask = mask & (corridor_mask.view(np.uint8) * 255)
 
         kernel_far = np.ones((2, 2), np.uint8)
         kernel_near = np.ones((3, 3), np.uint8)
