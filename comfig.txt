@@ -3,7 +3,7 @@
 # Linux例: save_base_dir=/home/ryuryu/lab/Robot_car
 # UNC例: save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
 
-save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\cr7_yas97\ss2025robot\datasets
+save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
 
 # 速度基準（UI初期値）
 drive_speed_default=60
@@ -20,8 +20,13 @@ ai_no_line_hold_frames=4
 ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
 line_process_interval_ms=70
+# カメラ配信プロファイル（low_latency / high_quality）
+# 低遅延重視は low_latency，画質重視は high_quality
+camera_stream_profile=low_latency
 # ライン抽出の色空間（lab または hsv）
 line_color_space=hsv
+# ライン検出プロファイル（default=panel_seam_glare / panel_seam / glare / panel_seam_glare）
+line_detection_profile=default
 # しきい値自動補正（見失いが多い場合は true 推奨）
 auto_threshold_enabled=true
 # AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
@@ -40,9 +45,9 @@ pid_integral_limit=1.5
 # ライン未検出時に停止するか
 pid_stop_on_no_line=true
 # 学習ゲインの時間平滑化（0.0:平滑なし, 1.0:非常に強い追従）
-pid_gain_smoothing_alpha=0.20
+pid_gain_smoothing_alpha=0.40
 # 操舵量のフレーム間変化上限（小さいほど暴れにくい）
-pid_steer_rate_limit=0.10
+pid_steer_rate_limit=0.20
 # モータ符号補正（直進でその場回転する場合は見直す）
 motor_left_sign=-1
 motor_right_sign=1
@@ -50,10 +55,12 @@ motor_right_sign=1
 # カメラ選択肢
 camera_id=camera_1
 camera_id=camera_2
-default_camera_id=camera_1
+camera_id=camera_4
+default_camera_id=camera_4
 
 # 走行種別は drive_type= で複数行書けます
 drive_type=straight
+drive_type=recovery
 drive_type=left_curve
 drive_type=right_curve
 drive_type=stop_and_go

@@ -1,14 +1,16 @@
 import logging
 import os
+import threading
 import tkinter as tk
 import time
 import cv2
+import numpy as np
 from tkinter import messagebox, ttk
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
 
-from ai_controller import LineTraceONNXController
+from pid_learned_controller import LearnedPIDONNXController
 from camera_receiver import CameraReceiver
 from config_loader import AppConfig, ensure_config_file, load_config, migrate_legacy_config_if_needed
 from control_logic import DriveParams, compute_dpad_command, compute_joystick_command
@@ -41,6 +43,46 @@ EMERGENCY_STOP_KEYS = {"space", "Escape"}
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+class _LineDetectionWorker:
+    """find_line() をバックグラウンドスレッドで実行し、UIスレッドのブロックを防ぐ。"""
+
+    def __init__(self, camera_receiver: CameraReceiver, interval_sec: float) -> None:
+        self._camera_receiver = camera_receiver
+        self._interval = max(0.02, float(interval_sec))
+        self._lock = threading.Lock()
+        self._latest_vis: Optional[np.ndarray] = None
+        self._latest_features: Dict[str, float] = camera_receiver.get_latest_line_features()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while self._running:
+            frame = self._camera_receiver.get_latest_frame()
+            vis = self._camera_receiver.find_line(frame)
+            features = self._camera_receiver.get_latest_line_features()
+            with self._lock:
+                self._latest_vis = vis
+                self._latest_features = features
+            time.sleep(self._interval)
+
+    def get_latest(self) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
+        with self._lock:
+            vis = self._latest_vis.copy() if self._latest_vis is not None else None
+            return vis, self._latest_features.copy()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class UnifiedApp:
@@ -85,22 +127,28 @@ class UnifiedApp:
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
-        self.ai_controller = LineTraceONNXController(
+        self.ai_controller = LearnedPIDONNXController(
             history=10,
             smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             stop_on_no_line=True,
-            curve_slowdown_sensitivity=self.config.curve_slowdown_sensitivity,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
+            gain_smoothing_alpha=self.config.pid_gain_smoothing_alpha,
+            steer_rate_limit=self.config.pid_steer_rate_limit,
         )
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
         self.ui_update_interval_ms = max(10, int(self.config.ui_update_interval_ms))
-        self._last_line_process_time = 0.0
         self._last_ai_control_time = 0.0
         self._cached_line_vis = None
         self._cached_line_features = self.camera_receiver.get_latest_line_features()
+
+        self._line_worker = _LineDetectionWorker(
+            camera_receiver=self.camera_receiver,
+            interval_sec=self.line_process_interval_sec,
+        )
+        self._line_worker.start()
         self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
         self._ai_error_logged = False
 
@@ -263,6 +311,31 @@ class UnifiedApp:
         )
         self.debug_overlay_check.pack(side=tk.LEFT, padx=(12, 0))
 
+        self.offset_filter_frame = tk.Frame(self.main_frame)
+        self.offset_filter_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
+        tk.Label(self.offset_filter_frame, text="Offsetジャンプ閾値(各ゾーン):").pack(side=tk.LEFT)
+        self.offset_jump_threshold_var = tk.DoubleVar(value=self.camera_receiver.get_offset_jump_threshold())
+        self.offset_jump_threshold_scale = tk.Scale(
+            self.offset_filter_frame,
+            from_=0.10,
+            to=1.00,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.offset_jump_threshold_var,
+            command=self.on_offset_jump_threshold_change,
+            showvalue=False,
+            length=160,
+        )
+        self.offset_jump_threshold_scale.pack(side=tk.LEFT)
+        self.offset_jump_threshold_label = tk.Label(
+            self.offset_filter_frame,
+            text=f"{self.camera_receiver.get_offset_jump_threshold():.2f}",
+            width=5,
+        )
+        self.offset_jump_threshold_label.pack(side=tk.LEFT)
+        tk.Label(self.offset_filter_frame, text="(1.00=無効)", fg="gray50").pack(side=tk.LEFT, padx=(4, 0))
+
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
@@ -416,6 +489,10 @@ class UnifiedApp:
 
     def on_drive_speed_change(self, _value: str) -> None:
         self.drive_speed_value_label.config(text=f"{self.get_drive_speed()}%")
+
+    def on_offset_jump_threshold_change(self, _value: str) -> None:
+        val = self.camera_receiver.set_offset_jump_threshold(float(self.offset_jump_threshold_var.get()))
+        self.offset_jump_threshold_label.config(text=f"{val:.2f}")
 
     def on_far_threshold_change(self, _value: str) -> None:
         far, _ = self.camera_receiver.set_thresholds(far_threshold=int(self.far_threshold_var.get()))
@@ -603,7 +680,6 @@ class UnifiedApp:
         self.send_command(0, 0)
         self.reset_ai_state()
         self._last_ai_control_time = 0.0
-        self._last_line_process_time = 0.0
         self.canvas.coords(
             self.stick,
             CENTER - STICK_RADIUS,
@@ -719,15 +795,11 @@ class UnifiedApp:
         frame = self.camera_receiver.get_latest_frame()
         now = time.perf_counter()
 
-        should_process_line = (
-            self._cached_line_vis is None
-            or (now - self._last_line_process_time) >= self.line_process_interval_sec
-        )
-        if should_process_line:
-            line_vis = self.camera_receiver.find_line(frame)
-            self._cached_line_vis = line_vis if line_vis is not None else frame
-            self._cached_line_features = self.camera_receiver.get_latest_line_features()
-            self._last_line_process_time = now
+        # バックグラウンドスレッドから最新のライン検出結果を取得
+        line_vis, line_features_from_worker = self._line_worker.get_latest()
+        if line_vis is not None:
+            self._cached_line_vis = line_vis
+            self._cached_line_features = line_features_from_worker
 
         display_src = self._cached_line_vis if self._cached_line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
@@ -830,6 +902,7 @@ class UnifiedApp:
         self.send_command(0, 0)
 
     def on_closing(self) -> None:
+        self._line_worker.stop()
         self.recorder.close_and_discard_on_exit()
         self.camera_receiver.stop()
         self.motor_client.close()

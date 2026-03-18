@@ -7,6 +7,19 @@ import numpy as np
 import cv2
 import zmq
 
+from vision.line_detection_config import LineDetectionConfig
+from vision.line_detection_config import (
+    DEFAULT_LINE_DETECTION_PROFILE,
+    build_line_detection_profile,
+)
+from vision.line_detection_rules import (
+    calc_blob_penalty,
+    calc_edge_penalty,
+    evaluate_contour_reject_reason,
+    evaluate_post_track_reject_reason,
+    is_soft_recover_candidate,
+)
+
 
 class CameraReceiver:
     def __init__(self, pi_ip: str, camera_port: int, logger: logging.Logger) -> None:
@@ -24,6 +37,10 @@ class CameraReceiver:
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._lost_feature_hold_frames = 8
+        self._offset_jump_threshold: float = 0.45
+        self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
+        self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
+        self._line_detection_config = LineDetectionConfig()
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -98,6 +115,8 @@ class CameraReceiver:
         self._consecutive_misses += 1
         if self._consecutive_misses > 8:
             self._prev_center_x = None
+            for zone in ("top", "mid", "bottom"):
+                self._prev_accepted_offsets[zone] = None
 
     def _on_detection_success(self, center_x: float) -> None:
         if self._prev_center_x is None:
@@ -115,11 +134,37 @@ class CameraReceiver:
             "line_offset_top": 0.0,
             "line_offset_mid": 0.0,
             "line_offset_bottom": 0.0,
+            "line_width_top": 0.0,
+            "line_width_mid": 0.0,
+            "line_width_bottom": 0.0,
         }
+
+    def get_offset_jump_threshold(self) -> float:
+        with self._lock:
+            return float(self._offset_jump_threshold)
+
+    def set_offset_jump_threshold(self, value: float) -> float:
+        with self._lock:
+            self._offset_jump_threshold = float(np.clip(value, 0.05, 1.0))
+            return self._offset_jump_threshold
 
     def _set_latest_line_features(self, features: Dict[str, float]) -> None:
         with self._lock:
             incoming = features.copy()
+
+            # Per-zone outlier rejection: offset が前フレームから急変したゾーンを detect=0 に落とす
+            threshold = self._offset_jump_threshold
+            for zone in ("top", "mid", "bottom"):
+                detect_key = f"line_detect_{zone}"
+                offset_key = f"line_offset_{zone}"
+                if float(incoming.get(detect_key, 0.0)) > 0.0:
+                    new_offset = float(incoming.get(offset_key, 0.0))
+                    prev = self._prev_accepted_offsets[zone]
+                    if prev is not None and abs(new_offset - prev) > threshold:
+                        # 外れ値: このゾーンをロスト扱いにする
+                        incoming[detect_key] = 0.0
+                    else:
+                        self._prev_accepted_offsets[zone] = new_offset
 
             incoming_detect_sum = (
                 float(incoming.get("line_detect_top", 0.0))
@@ -198,6 +243,27 @@ class CameraReceiver:
             self._line_color_space = normalized
             return str(self._line_color_space)
 
+    def get_line_detection_config(self) -> LineDetectionConfig:
+        with self._lock:
+            return self._line_detection_config
+
+    def set_line_detection_config(self, config: LineDetectionConfig) -> LineDetectionConfig:
+        with self._lock:
+            self._line_detection_config = config
+            return self._line_detection_config
+
+    def get_line_detection_profile_name(self) -> str:
+        with self._lock:
+            return str(self._line_detection_profile_name)
+
+    def set_line_detection_profile_name(self, profile_name: str) -> str:
+        profile = str(profile_name).strip().lower() or DEFAULT_LINE_DETECTION_PROFILE
+        cfg = build_line_detection_profile(profile)
+        with self._lock:
+            self._line_detection_profile_name = profile
+            self._line_detection_config = cfg
+            return str(self._line_detection_profile_name)
+
     def _prepare_intensity_channel(self, roi: np.ndarray) -> Tuple[np.ndarray, str]:
         mode = self.get_line_color_space()
 
@@ -275,78 +341,71 @@ class CameraReceiver:
         with self._lock:
             return self._image.copy()
 
-    def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
-        vis = img.copy()
-        h, w = vis.shape[:2]
-        features = self._default_line_features()
-        debug_overlay_enabled = self.is_debug_overlay_enabled()
+    def _build_line_mask(
+        self,
+        vis: np.ndarray,
+        roi_top: int,
+        frame_width: int,
+    ) -> tuple[np.ndarray, int, int, int, str]:
+        roi_full = vis[roi_top:, :]
+        roi_h_full = roi_full.shape[0]
 
-        # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
-        roi_top = int(h * 0.03)
-        roi = vis[roi_top:, :]
+        # 半分の解像度でマスク処理を行い高速化（処理面積 1/4）
+        proc_w = frame_width // 2
+        proc_h = roi_h_full // 2
+        roi = cv2.resize(roi_full, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
 
-        # 照明ムラ対策: 設定された色空間の輝度系チャネルをCLAHEで補正
         blur, intensity_mode = self._prepare_intensity_channel(roi)
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
         far_threshold, near_threshold = self._resolve_thresholds(blur=blur, far_split=far_split)
-
         _, mask_far = cv2.threshold(blur[:far_split, :], far_threshold, 255, cv2.THRESH_BINARY_INV)
         _, mask_near = cv2.threshold(blur[far_split:, :], near_threshold, 255, cv2.THRESH_BINARY_INV)
 
         global_mask = np.zeros_like(blur, dtype=np.uint8)
         global_mask[:far_split, :] = mask_far
         global_mask[far_split:, :] = mask_near
-
         mask = global_mask.copy()
 
-        # 前回中心がある場合のみ探索帯で絞る。見失い時は絞りを弱めて再捕捉優先。
         if self._prev_center_x is not None and self._consecutive_misses < 3:
-            center_hint = float(np.clip(self._prev_center_x, 0.0, float(w - 1)))
+            center_hint = float(np.clip(self._prev_center_x * 0.5, 0.0, float(proc_w - 1)))
             relax_ratio = min(0.30, 0.08 * float(self._consecutive_misses))
-            corridor_mask = np.zeros_like(mask, dtype=np.uint8)
             upper_safe_limit = int(roi_h * 0.78)
-            edge_lock_risk = abs(center_hint - (w * 0.5)) > (0.28 * float(w))
+            edge_lock_risk = abs(center_hint - (proc_w * 0.5)) > (0.28 * float(proc_w))
 
-            for r in range(roi_h):
-                t = float(r) / max(1.0, float(roi_h - 1))
+            # 全行の t を一括計算
+            rows = np.arange(roi_h, dtype=np.float64)
+            t = rows / max(1.0, float(roi_h - 1))
+            cols = np.arange(proc_w, dtype=np.float64)
 
-                # メイン探索帯: 遠方(上)は広く、近傍(下)は狭く
-                main_half_ratio = (0.56 * (1.0 - t)) + (0.24 * t) + relax_ratio
-                main_half_ratio = float(np.clip(main_half_ratio, 0.18, 0.78))
-                main_half = int(main_half_ratio * float(w))
-                x1_main = max(0, int(center_hint) - main_half)
-                x2_main = min(w, int(center_hint) + main_half)
-                if x2_main > x1_main:
-                    corridor_mask[r, x1_main:x2_main] = 255
+            # main帯: center_hint 中心で幅が行ごとに変わる
+            main_half = np.clip((0.56 * (1.0 - t) + 0.24 * t + relax_ratio), 0.18, 0.78) * float(proc_w)
+            x1_main = np.clip(center_hint - main_half, 0, proc_w).astype(np.int32)
+            x2_main = np.clip(center_hint + main_half, 0, proc_w).astype(np.int32)
+            # cols[None, :] >= x1[:, None] でブロードキャスト比較 → bool マスク
+            corridor_mask = ((cols[None, :] >= x1_main[:, None]) & (cols[None, :] < x2_main[:, None]))
 
-                # 上側は中央寄りの安全帯も残し、大きなカーブでの取りこぼしを抑える
-                if r < upper_safe_limit:
-                    safe_half_ratio = (0.62 * (1.0 - t)) + (0.32 * t)
-                    safe_half_ratio = float(np.clip(safe_half_ratio, 0.28, 0.74))
-                    safe_half = int(safe_half_ratio * float(w))
-                    x1_safe = max(0, (w // 2) - safe_half)
-                    x2_safe = min(w, (w // 2) + safe_half)
-                    if x2_safe > x1_safe:
-                        corridor_mask[r, x1_safe:x2_safe] = 255
+            # safe帯: 画面中心基準、upper_safe_limit行まで
+            safe_half = np.clip((0.62 * (1.0 - t) + 0.32 * t), 0.28, 0.74) * float(proc_w)
+            center_mid = float(proc_w // 2)
+            x1_safe = np.clip(center_mid - safe_half, 0, proc_w).astype(np.int32)
+            x2_safe = np.clip(center_mid + safe_half, 0, proc_w).astype(np.int32)
+            safe_band = ((cols[None, :] >= x1_safe[:, None]) & (cols[None, :] < x2_safe[:, None]))
+            safe_band[upper_safe_limit:, :] = False
+            corridor_mask |= safe_band
 
-                # If tracking drifts to left/right edge, keep a center rescue band
-                # on all depths to allow fast re-capture of the true line.
-                if edge_lock_risk:
-                    rescue_half_ratio = (0.26 * (1.0 - t)) + (0.18 * t)
-                    rescue_half_ratio = float(np.clip(rescue_half_ratio, 0.16, 0.30))
-                    rescue_half = int(rescue_half_ratio * float(w))
-                    x1_rescue = max(0, (w // 2) - rescue_half)
-                    x2_rescue = min(w, (w // 2) + rescue_half)
-                    if x2_rescue > x1_rescue:
-                        corridor_mask[r, x1_rescue:x2_rescue] = 255
+            # rescue帯: edge_lock_risk時のみ、画面中心基準
+            if edge_lock_risk:
+                rescue_half = np.clip((0.26 * (1.0 - t) + 0.18 * t), 0.16, 0.30) * float(proc_w)
+                x1_rescue = np.clip(center_mid - rescue_half, 0, proc_w).astype(np.int32)
+                x2_rescue = np.clip(center_mid + rescue_half, 0, proc_w).astype(np.int32)
+                corridor_mask |= ((cols[None, :] >= x1_rescue[:, None]) & (cols[None, :] < x2_rescue[:, None]))
 
-            mask = cv2.bitwise_and(mask, corridor_mask)
+            mask = mask & (corridor_mask.view(np.uint8) * 255)
 
-        # 遠方は細線を残すため弱め、手前はノイズ除去を強めに処理
-        kernel_far = np.ones((3, 3), np.uint8)
-        kernel_near = np.ones((5, 5), np.uint8)
+        kernel_far = np.ones((2, 2), np.uint8)
+        kernel_near = np.ones((3, 3), np.uint8)
         far_region = cv2.morphologyEx(mask[:far_split, :], cv2.MORPH_OPEN, kernel_far)
         far_region = cv2.morphologyEx(far_region, cv2.MORPH_CLOSE, kernel_far)
         near_region = cv2.morphologyEx(mask[far_split:, :], cv2.MORPH_OPEN, kernel_near)
@@ -354,13 +413,227 @@ class CameraReceiver:
         mask[:far_split, :] = far_region
         mask[far_split:, :] = near_region
 
-        # 白飛びで欠けた縦方向の途切れを埋める
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 3), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((4, 2), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 4), np.uint8))
 
-        # 3分割ガイド（遠/中/近）
-        y1 = h // 3
-        y2 = (2 * h) // 3
+        # 元解像度に戻す（輪郭検出・追跡・スコアリングは元解像度で動作）
+        mask = cv2.resize(mask, (frame_width, roi_h_full), interpolation=cv2.INTER_NEAREST)
+        return mask, roi_h_full, far_threshold, near_threshold, intensity_mode
+
+    def _find_best_contour(
+        self,
+        contours: list[np.ndarray],
+        roi_h: int,
+        frame_width: int,
+    ) -> tuple[float, Optional[int], Optional[np.ndarray], list[Dict[str, float | int | str]]]:
+        cfg = self.get_line_detection_config()
+
+        def max_segment_width_px(row_index: int) -> int:
+            t = float(row_index) / max(1.0, float(roi_h - 1))
+            base_ratio = 0.18 + (0.22 * t)
+            relax_ratio = min(0.10, 0.025 * float(self._consecutive_misses))
+            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.52))
+            return int(np.clip(int(ratio * float(frame_width)), 8, 260))
+
+        contour_entries: list[Dict[str, float | int | str]] = []
+        scored_contours: list[tuple[float, int, np.ndarray]] = []
+
+        for idx, cnt in enumerate(contours):
+            area = float(cv2.contourArea(cnt))
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            span_ratio = float(bh) / max(1.0, float(roi_h))
+            fill_ratio = area / max(1.0, float(bw * bh)) if bw > 0 and bh > 0 else 0.0
+            bw_ratio = float(bw) / max(1.0, float(frame_width))
+            avg_row_width = area / max(1.0, float(bh))
+            mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
+            aspect = float(bh) / max(1.0, float(bw))
+
+            touch_left = x <= 2
+            touch_right = (x + bw) >= (frame_width - 2)
+            touch_top = y <= 2
+            touch_bottom = (y + bh) >= (roi_h - 2)
+
+            reason = evaluate_contour_reject_reason(
+                area=area,
+                span_ratio=span_ratio,
+                fill_ratio=fill_ratio,
+                bw_ratio=bw_ratio,
+                avg_row_width=avg_row_width,
+                mid_allowed_width=mid_allowed_width,
+                aspect=aspect,
+                touch_left=touch_left,
+                touch_right=touch_right,
+                touch_top=touch_top,
+                touch_bottom=touch_bottom,
+                cfg=cfg.contour,
+            )
+
+            score = -1.0
+            if reason is None:
+                bottom_reach = float(y + bh) / max(1.0, float(roi_h))
+                cx = float(x) + float(bw) * 0.5
+
+                if self._prev_center_x is not None and self._consecutive_misses < 2:
+                    center_ref = float(self._prev_center_x)
+                    center_weight = 0.55
+                    center_floor = 0.45
+                else:
+                    center_ref = float(frame_width * 0.5)
+                    center_weight = 0.28
+                    center_floor = 0.62
+
+                dist_center = abs(cx - center_ref) / max(1.0, (frame_width * 0.5))
+                center_bonus = max(center_floor, 1.0 - center_weight * dist_center)
+                span_bonus = 0.7 + 1.2 * min(span_ratio, 1.0)
+                bottom_bonus = 0.7 + 0.6 * min(bottom_reach, 1.0)
+                shape_bonus = 0.75 + 0.35 * min(aspect / 3.0, 1.0)
+                blob_penalty = calc_blob_penalty(width_ratio=bw_ratio, span_ratio=span_ratio, cfg=cfg.contour)
+                edge_penalty = calc_edge_penalty(
+                    touch_left=touch_left,
+                    touch_right=touch_right,
+                    prev_center_x=self._prev_center_x,
+                    frame_width=frame_width,
+                    cfg=cfg.contour,
+                )
+                score = area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty * edge_penalty
+
+            contour_entries.append(
+                {
+                    "idx": idx,
+                    "score": float(score),
+                    "reason": reason if reason else "",
+                    "x": float(x),
+                    "y": float(y),
+                    "bw": float(bw),
+                    "bh": float(bh),
+                }
+            )
+            scored_contours.append((float(score), idx, cnt))
+
+        best_score, best_idx, target = max(scored_contours, key=lambda item: item[0])
+        if best_score > 0.0:
+            return best_score, best_idx, target, contour_entries
+
+        soft_best_score = -1.0
+        soft_best_idx = None
+        soft_best_cnt = None
+        for idx, cnt in enumerate(contours):
+            area = float(cv2.contourArea(cnt))
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            span_ratio = float(bh) / max(1.0, float(roi_h))
+            bw_ratio = float(bw) / max(1.0, float(frame_width))
+            fill_ratio = area / max(1.0, float(bw * bh)) if bw > 0 and bh > 0 else 0.0
+            touch_left = x <= 2
+            touch_right = (x + bw) >= (frame_width - 2)
+
+            if not is_soft_recover_candidate(
+                area=area,
+                span_ratio=span_ratio,
+                bw_ratio=bw_ratio,
+                fill_ratio=fill_ratio,
+                touch_left=touch_left,
+                touch_right=touch_right,
+                cfg=cfg.soft_recover,
+            ):
+                continue
+
+            cx = float(x) + (0.5 * float(bw))
+            bottom_reach = float(y + bh) / max(1.0, float(roi_h))
+            aspect = float(bh) / max(1.0, float(bw))
+
+            if self._prev_center_x is not None and self._consecutive_misses < 4:
+                center_ref = float(self._prev_center_x)
+            else:
+                center_ref = float(frame_width * 0.5)
+            center_dist = abs(cx - center_ref) / max(1.0, (frame_width * 0.5))
+            center_bonus = max(0.35, 1.0 - (0.60 * center_dist))
+            shape_bonus = 0.65 + (0.65 * min(span_ratio, 1.0)) + (0.20 * min(aspect / 3.0, 1.0))
+            bottom_bonus = 0.65 + (0.55 * min(bottom_reach, 1.0))
+            score = area * shape_bonus * bottom_bonus * center_bonus
+            if score > soft_best_score:
+                soft_best_score = float(score)
+                soft_best_idx = idx
+                soft_best_cnt = cnt
+
+        if soft_best_idx is None or soft_best_cnt is None:
+            return best_score, best_idx, target, contour_entries
+
+        for entry in contour_entries:
+            if int(entry["idx"]) == int(soft_best_idx):
+                entry["reason"] = "soft_recover"
+                entry["score"] = float(soft_best_score)
+                break
+        return soft_best_score, int(soft_best_idx), soft_best_cnt, contour_entries
+
+    def _precompute_row_segments(
+        self,
+        target_mask: np.ndarray,
+        frame_width: int,
+    ) -> Dict[int, list[tuple[float, float, int, int]]]:
+        """target_mask の全行セグメント (cx, width, xmin, xmax) を一括計算する。"""
+        roi_h = target_mask.shape[0]
+        ys, xs = np.nonzero(target_mask)
+        if ys.size == 0:
+            return {}
+
+        # 行ごとの最大許容セグメント幅をベクトル化計算
+        # カーブ時にコース幅が広がることを考慮し、Near側は最大75%まで許容
+        all_rows = np.arange(roi_h, dtype=np.float64)
+        t = all_rows / max(1.0, float(roi_h - 1))
+        base_ratio = 0.18 + 0.57 * t
+        relax = min(0.10, 0.025 * float(self._consecutive_misses))
+        ratio = np.clip(base_ratio + relax, 0.16, 0.75)
+        max_widths = np.clip((ratio * float(frame_width)).astype(np.int32), 8, int(frame_width * 0.90))
+
+        unique_rows, starts, counts = np.unique(ys, return_index=True, return_counts=True)
+        result: Dict[int, list[tuple[float, float, int, int]]] = {}
+        for i in range(unique_rows.size):
+            r = int(unique_rows[i])
+            row_xs = xs[starts[i]:starts[i] + counts[i]]
+            if row_xs.size < 2:
+                continue
+
+            max_w = int(max_widths[r])
+            gaps = np.where(np.diff(row_xs) > 1)[0] + 1
+            bounds = np.empty(gaps.size + 2, dtype=np.intp)
+            bounds[0] = 0
+            bounds[1:gaps.size + 1] = gaps
+            bounds[-1] = row_xs.size
+
+            segs: list[tuple[float, float, int, int]] = []
+            for j in range(bounds.size - 1):
+                seg_slice = row_xs[bounds[j]:bounds[j + 1]]
+                if seg_slice.size < 2:
+                    continue
+                x_min = int(seg_slice[0])
+                x_max = int(seg_slice[-1])
+                seg_w = x_max - x_min
+                if seg_w <= 1 or seg_w > max_w:
+                    continue
+                segs.append((0.5 * (x_min + x_max), float(seg_w), x_min, x_max))
+
+            if segs:
+                result[r] = segs
+        return result
+
+    def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
+        vis = img.copy()
+        h, w = vis.shape[:2]
+        features = self._default_line_features()
+        debug_overlay_enabled = self.is_debug_overlay_enabled()
+
+        # 上部25%をカットして処理負荷を削減
+        roi_top = int(h * 0.25)
+        mask, roi_h, far_threshold, near_threshold, intensity_mode = self._build_line_mask(
+            vis=vis,
+            roi_top=roi_top,
+            frame_width=w,
+        )
+
+        # 3分割ガイド（遠/中/近）: ROI内を均等3分割
+        _roi_available = h - roi_top
+        y1 = roi_top + _roi_available // 3
+        y2 = roi_top + 2 * _roi_available // 3
         cv2.line(vis, (0, y1), (w - 1, y1), (120, 120, 120), 1)
         cv2.line(vis, (0, y2), (w - 1, y2), (120, 120, 120), 1)
         cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
@@ -384,198 +657,17 @@ class CameraReceiver:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
-
-        def max_segment_width_px(row_index: int) -> int:
-            t = float(row_index) / max(1.0, float(roi_h - 1))
-            # カーブ時の幅変化を許容しつつ、巨大塊は除外
-            base_ratio = 0.18 + (0.22 * t)
-            relax_ratio = min(0.10, 0.025 * float(self._consecutive_misses))
-            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.52))
-            return int(np.clip(int(ratio * float(w)), 8, 260))
-
-        def contour_score(cnt: np.ndarray) -> Tuple[float, str, Dict[str, float]]:
-            area = float(cv2.contourArea(cnt))
-            meta: Dict[str, float] = {
-                "area": area,
-                "x": 0.0,
-                "y": 0.0,
-                "bw": 0.0,
-                "bh": 0.0,
-                "fill_ratio": 0.0,
-            }
-            if area <= 0.0:
-                return -1.0, "area0", meta
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            meta["x"] = float(x)
-            meta["y"] = float(y)
-            meta["bw"] = float(bw)
-            meta["bh"] = float(bh)
-            span_ratio = float(bh) / max(1.0, float(roi_h))
-            if area < 120.0 or span_ratio < 0.08:
-                return -1.0, "small", meta
-
-            fill_ratio = area / max(1.0, float(bw * bh))
-            meta["fill_ratio"] = fill_ratio
-            bw_ratio = float(bw) / max(1.0, float(w))
-            avg_row_width = area / max(1.0, float(bh))
-            mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
-            aspect = float(bh) / max(1.0, float(bw))
-
-            touch_left = x <= 2
-            touch_right = (x + bw) >= (w - 2)
-            touch_top = y <= 2
-            touch_bottom = (y + bh) >= (roi_h - 2)
-
-            # 線ではなく塊になった暗領域を除外
-            if fill_ratio > 0.72 and (float(bh) / max(1.0, float(bw))) < 2.0:
-                return -1.0, "blob_fill", meta
-            if bw_ratio > 0.62 and fill_ratio > 0.35:
-                return -1.0, "blob_wide", meta
-            if avg_row_width > (mid_allowed_width * 1.85):
-                return -1.0, "row_wide", meta
-            # タイルの目地など、細く横長で密度の低い暗線を除外
-            if avg_row_width < 10.0 and fill_ratio < 0.24 and span_ratio < 0.32 and aspect < 0.95:
-                return -1.0, "seam_thin", meta
-            if bw_ratio > 0.30 and aspect < 0.42 and avg_row_width < 16.0 and fill_ratio < 0.34:
-                return -1.0, "seam_horizontal", meta
-            # 画面内を蛇行して長く伸びる細線（目地/反射エッジ）を除外
-            if fill_ratio < 0.12 and avg_row_width < 14.0 and bw_ratio > 0.34 and span_ratio > 0.42:
-                return -1.0, "seam_snake", meta
-            # 画面端にべったり張り付いた太い暗領域は除外
-            # ただし、カーブ本線は端に接しやすいので条件を厳しめにして誤除外を防ぐ
-            if (
-                (touch_left or touch_right)
-                and bw_ratio > 0.70
-                and fill_ratio > 0.26
-                and span_ratio > 0.30
-                and aspect < 1.85
-            ):
-                return -1.0, "edge_blob", meta
-            # 画面端の細い縦スジ（パネル境界など）を除外
-            if (touch_left or touch_right) and bw_ratio < 0.05 and span_ratio > 0.65 and fill_ratio > 0.30 and aspect > 3.4:
-                return -1.0, "edge_strip", meta
-            if (touch_left and touch_right) and bw_ratio > 0.25:
-                return -1.0, "full_span", meta
-            # 上下端をまたぐ候補は、太くて塊っぽい場合のみ除外（本命ラインは通す）
-            if (touch_top and touch_bottom) and bw_ratio > 0.34 and fill_ratio > 0.30 and aspect < 2.0:
-                return -1.0, "vertical_blob", meta
-
-            bottom_reach = float(y + bh) / max(1.0, float(roi_h))
-            cx = float(x) + float(bw) * 0.5
-
-            if self._prev_center_x is not None and self._consecutive_misses < 2:
-                center_ref = float(self._prev_center_x)
-                center_weight = 0.55
-                center_floor = 0.45
-            else:
-                # 見失い時は中心寄りバイアスを弱めて、反対側カーブの再捕捉を優先
-                center_ref = float(w * 0.5)
-                center_weight = 0.28
-                center_floor = 0.62
-
-            dist_center = abs(cx - center_ref) / max(1.0, (w * 0.5))
-            center_bonus = max(center_floor, 1.0 - center_weight * dist_center)
-
-            span_bonus = 0.7 + 1.2 * min(span_ratio, 1.0)
-            bottom_bonus = 0.7 + 0.6 * min(bottom_reach, 1.0)
-            shape_bonus = 0.75 + 0.35 * min(aspect / 3.0, 1.0)
-
-            # 横に広すぎる黒塊は誤検出しやすいので軽く減点
-            width_ratio = float(bw) / max(1.0, float(w))
-            blob_penalty = 0.65 if width_ratio > 0.82 and span_ratio < 0.55 else 1.0
-
-            # Edge-touch candidates are common false locks; keep them but score lower
-            # so non-edge line candidates can win when available.
-            edge_penalty = 1.0
-            if touch_left or touch_right:
-                edge_penalty = 0.72
-                if self._prev_center_x is not None:
-                    if abs(float(self._prev_center_x) - (w * 0.5)) > (0.30 * float(w)):
-                        edge_penalty = 0.55
-
-            score = area * span_bonus * bottom_bonus * shape_bonus * center_bonus * blob_penalty * edge_penalty
-            return score, "", meta
-
-        contour_entries: list[Dict[str, float | int | str]] = []
-        scored_contours = []
-        for idx, cnt in enumerate(contours):
-            score, reason, meta = contour_score(cnt)
-            contour_entries.append(
-                {
-                    "idx": idx,
-                    "score": float(score),
-                    "reason": reason,
-                    "x": float(meta.get("x", 0.0)),
-                    "y": float(meta.get("y", 0.0)),
-                    "bw": float(meta.get("bw", 0.0)),
-                    "bh": float(meta.get("bh", 0.0)),
-                }
-            )
-            scored_contours.append((float(score), idx, cnt))
-
-        best_score, best_idx, target = max(scored_contours, key=lambda item: item[0])
-
-        if best_score <= 0.0:
-            # Soft-recovery fallback: when strict filters reject all contours,
-            # pick the most line-like candidate to avoid prolonged no-detection.
-            soft_best_score = -1.0
-            soft_best_idx = None
-            soft_best_cnt = None
-
-            for idx, cnt in enumerate(contours):
-                area = float(cv2.contourArea(cnt))
-                if area <= 80.0:
-                    continue
-
-                x, y, bw, bh = cv2.boundingRect(cnt)
-                span_ratio = float(bh) / max(1.0, float(roi_h))
-                bw_ratio = float(bw) / max(1.0, float(w))
-                fill_ratio = area / max(1.0, float(bw * bh))
-
-                if span_ratio < 0.06:
-                    continue
-                if bw_ratio > 0.90 and fill_ratio > 0.40:
-                    continue
-
-                touch_left = x <= 2
-                touch_right = (x + bw) >= (w - 2)
-                if (touch_left and touch_right) and bw_ratio > 0.70:
-                    continue
-
-                cx = float(x) + (0.5 * float(bw))
-                bottom_reach = float(y + bh) / max(1.0, float(roi_h))
-                aspect = float(bh) / max(1.0, float(bw))
-
-                if self._prev_center_x is not None and self._consecutive_misses < 4:
-                    center_ref = float(self._prev_center_x)
-                else:
-                    center_ref = float(w * 0.5)
-                center_dist = abs(cx - center_ref) / max(1.0, (w * 0.5))
-                center_bonus = max(0.35, 1.0 - (0.60 * center_dist))
-
-                shape_bonus = 0.65 + (0.65 * min(span_ratio, 1.0)) + (0.20 * min(aspect / 3.0, 1.0))
-                bottom_bonus = 0.65 + (0.55 * min(bottom_reach, 1.0))
-
-                score = area * shape_bonus * bottom_bonus * center_bonus
-                if score > soft_best_score:
-                    soft_best_score = float(score)
-                    soft_best_idx = idx
-                    soft_best_cnt = cnt
-
-            if soft_best_idx is not None and soft_best_cnt is not None:
-                best_score = soft_best_score
-                best_idx = int(soft_best_idx)
-                target = soft_best_cnt
-                for entry in contour_entries:
-                    if int(entry["idx"]) == best_idx:
-                        entry["reason"] = "soft_recover"
-                        entry["score"] = float(best_score)
-                        break
+        best_score, best_idx, target, contour_entries = self._find_best_contour(
+            contours=contours,
+            roi_h=roi_h,
+            frame_width=w,
+        )
 
         if debug_overlay_enabled:
             self._draw_debug_overlay(vis, roi_top, contour_entries, best_idx=best_idx)
 
-        if best_score <= 0.0 or cv2.contourArea(target) <= 220:
+        min_final_area = self.get_line_detection_config().post_track.final_contour_area_min
+        if best_score <= 0.0 or cv2.contourArea(target) <= min_final_area:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -594,27 +686,8 @@ class CameraReceiver:
         seed_x = float(self._prev_center_x) if self._prev_center_x is not None else (w * 0.5)
         seed_x = float(np.clip(seed_x, 0.0, float(w - 1)))
 
-        def row_segments(row_index: int, row: np.ndarray) -> list[tuple[float, float, int, int]]:
-            xs = np.flatnonzero(row > 0)
-            if xs.size < 2:
-                return []
-            split_idx = np.where(np.diff(xs) > 1)[0] + 1
-            segments = np.split(xs, split_idx)
-            result: list[tuple[float, float, int, int]] = []
-            max_seg_w = max_segment_width_px(row_index)
-            for seg in segments:
-                if seg.size < 2:
-                    continue
-                x_min = int(seg[0])
-                x_max = int(seg[-1])
-                seg_w = x_max - x_min
-                if seg_w <= 1:
-                    continue
-                if seg_w > max_seg_w:
-                    continue
-                cx = 0.5 * (x_min + x_max)
-                result.append((float(cx), float(seg_w), x_min, x_max))
-            return result
+        # 全行のセグメント情報を一括計算（行ごとのNumPy呼び出しを排除）
+        all_row_segs = self._precompute_row_segments(target_mask, w)
 
         seed_center_row = int(np.clip(roi_h * 0.52, 0, roi_h - 1))
         seed_r0 = max(0, seed_center_row - 30)
@@ -623,7 +696,7 @@ class CameraReceiver:
         best_seed = None
         best_seed_cost = float("inf")
         for r in range(seed_r0, seed_r1):
-            segs = row_segments(r, target_mask[r, :])
+            segs = all_row_segs.get(r, [])
             for cx, seg_w, x_min, x_max in segs:
                 width_cost = max(0.0, seg_w - (0.45 * float(w))) * 0.20
                 border_penalty = 20.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
@@ -656,7 +729,7 @@ class CameraReceiver:
 
             end = roi_h if step > 0 else -1
             for r in range(start_row, end, step):
-                segs = row_segments(r, target_mask[r, :])
+                segs = all_row_segs.get(r, [])
                 if not segs:
                     misses += 1
                     if misses > max_misses:
@@ -743,36 +816,36 @@ class CameraReceiver:
             self._set_latest_line_features(features)
             return vis
 
-        # 幅が異常に太い場合は誤検出扱い（見失いに倒す）
+        # 中心線追跡後の最終除外判定を行う
+        cfg = self.get_line_detection_config()
         width_med = float(np.median(valid_widths))
         width_p90 = float(np.percentile(valid_widths, 90))
-        # 幅だけで早期に落としすぎると本線を取りこぼすので、極端な場合のみ除外
-        if width_med > (0.18 * float(w)) and width_p90 > (0.28 * float(w)):
-            if debug_overlay_enabled:
-                cv2.putText(
-                    vis,
-                    "reject: too_wide",
-                    (10, 104),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (0, 0, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-            self._on_detection_lost()
-            self._set_latest_line_features(features)
-            return vis
-
-        # Near帯に届かない細線は、目地/反射エッジの誤検出として弾く
-        near_anchor_global = int((2 * h) // 3)
+        near_anchor_global = y2
         near_anchor_row = int(np.clip(near_anchor_global - roi_top, 0, roi_h - 1))
         has_near_support = bool(np.any(valid_rows >= max(0, near_anchor_row - 10)))
         bottom_reach_ratio = float(valid_rows.max()) / max(1.0, float(roi_h - 1))
-        if (not has_near_support) and (width_p90 < 16.0):
+        near_rows_mask = valid_rows >= near_anchor_row
+        near_rows_count = int(np.count_nonzero(near_rows_mask))
+        near_width_med = float(np.median(valid_widths[near_rows_mask])) if near_rows_count > 0 else 0.0
+        span_rows = int(valid_rows.max() - valid_rows.min() + 1)
+        span_ratio_rows = float(span_rows) / max(1.0, float(roi_h))
+
+        post_reject_reason = evaluate_post_track_reject_reason(
+            width_med=width_med,
+            width_p90=width_p90,
+            frame_width=w,
+            has_near_support=has_near_support,
+            bottom_reach_ratio=bottom_reach_ratio,
+            near_rows_count=near_rows_count,
+            near_width_med=near_width_med,
+            span_ratio_rows=span_ratio_rows,
+            cfg=cfg.post_track,
+        )
+        if post_reject_reason is not None:
             if debug_overlay_enabled:
                 cv2.putText(
                     vis,
-                    "reject: far_thin",
+                    f"reject: {post_reject_reason}",
                     (10, 122),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.48,
@@ -780,49 +853,6 @@ class CameraReceiver:
                     1,
                     cv2.LINE_AA,
                 )
-            self._on_detection_lost()
-            self._set_latest_line_features(features)
-            return vis
-        if width_med < 9.0 and bottom_reach_ratio < 0.72:
-            if debug_overlay_enabled:
-                cv2.putText(
-                    vis,
-                    "reject: thin_no_near",
-                    (10, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (0, 0, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-            self._on_detection_lost()
-            self._set_latest_line_features(features)
-            return vis
-
-        # Near帯の支えが弱い（短い/細い）候補は安全側で除外
-        near_rows_mask = valid_rows >= near_anchor_row
-        near_rows_count = int(np.count_nonzero(near_rows_mask))
-        near_width_med = float(np.median(valid_widths[near_rows_mask])) if near_rows_count > 0 else 0.0
-        if near_rows_count < 14 and near_width_med < 14.0 and width_med < 11.0:
-            if debug_overlay_enabled:
-                cv2.putText(
-                    vis,
-                    "reject: near_weak",
-                    (10, 158),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (0, 0, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-            self._on_detection_lost()
-            self._set_latest_line_features(features)
-            return vis
-
-        # 細い線が中段の短い範囲だけ残る場合は、目地誤検出の可能性が高い
-        span_rows = int(valid_rows.max() - valid_rows.min() + 1)
-        span_ratio_rows = float(span_rows) / max(1.0, float(roi_h))
-        if width_med < 8.0 and width_p90 < 13.0 and span_ratio_rows < 0.35:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -904,7 +934,7 @@ class CameraReceiver:
 
         # 遠/中/近 3点（固定深度位置で算出）
         zones = [
-            ("Far", "top", 0, y1, y1 // 2),
+            ("Far", "top", roi_top, y1, (roi_top + y1) // 2),
             ("Mid", "mid", y1, y2, (y1 + y2) // 2),
             ("Near", "bottom", y2, h, (y2 + h) // 2),
         ]
@@ -925,10 +955,12 @@ class CameraReceiver:
             px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
             wz = int(max(0.0, interp_widths[ay]))
 
-            # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離）
+            # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離 + 幅）
             offset_norm = float((px - (w / 2.0)) / max(w / 2.0, 1.0))
+            width_norm = float(wz) / max(1.0, float(w))
             features[f"line_detect_{zone_key}"] = 1.0
             features[f"line_offset_{zone_key}"] = float(np.clip(offset_norm, -1.0, 1.0))
+            features[f"line_width_{zone_key}"] = float(np.clip(width_norm, 0.0, 1.0))
 
             py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
@@ -952,6 +984,11 @@ class CameraReceiver:
         cam_socket.setsockopt(zmq.CONFLATE, 1)
         cam_socket.connect(f"tcp://{self.pi_ip}:{self.camera_port}")
 
+        frame_sizes = {
+            320 * 240 * 3: (240, 320),
+            640 * 480 * 3: (480, 640),
+        }
+
         try:
             while self._running:
                 try:
@@ -960,9 +997,15 @@ class CameraReceiver:
                     time.sleep(0.01)
                     continue
                 try:
-                    img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
+                    shape_hw = frame_sizes.get(len(data))
+                    if shape_hw is None:
+                        self.logger.debug("Unexpected frame size: %d", len(data))
+                        continue
+                    h, w = shape_hw
+                    img = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    img = cv2.resize(img, (640, 480))
+                    if (w, h) != (640, 480):
+                        img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_LINEAR)
                     with self._lock:
                         self._image = img
                 except Exception as exc:

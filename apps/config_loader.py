@@ -18,6 +18,8 @@ class AppConfig:
     ai_smoothing_alpha: float
     ai_no_line_hold_frames: int
     ai_no_line_brake_frames: int
+    pid_gain_smoothing_alpha: float
+    pid_steer_rate_limit: float
     line_process_interval_ms: int
     ai_control_interval_ms: int
     ui_update_interval_ms: int
@@ -73,6 +75,8 @@ def load_config(
     configured_ai_smoothing_alpha = 0.35
     configured_ai_no_line_hold_frames = 3
     configured_ai_no_line_brake_frames = 8
+    configured_pid_gain_smoothing_alpha = 0.25
+    configured_pid_steer_rate_limit = 0.18
     configured_line_process_interval_ms = 70
     configured_ai_control_interval_ms = 100
     configured_ui_update_interval_ms = 30
@@ -127,6 +131,16 @@ def load_config(
                         configured_ai_no_line_brake_frames = int(float(value))
                     except ValueError:
                         logger.warning("Invalid ai_no_line_brake_frames: %s", value)
+                elif key == "pid_gain_smoothing_alpha" and value:
+                    try:
+                        configured_pid_gain_smoothing_alpha = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_gain_smoothing_alpha: %s", value)
+                elif key == "pid_steer_rate_limit" and value:
+                    try:
+                        configured_pid_steer_rate_limit = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_steer_rate_limit: %s", value)
                 elif key == "line_process_interval_ms" and value:
                     try:
                         configured_line_process_interval_ms = int(float(value))
@@ -174,6 +188,8 @@ def load_config(
     configured_ai_smoothing_alpha = max(0.0, min(1.0, float(configured_ai_smoothing_alpha)))
     configured_ai_no_line_hold_frames = max(0, min(60, int(configured_ai_no_line_hold_frames)))
     configured_ai_no_line_brake_frames = max(1, min(120, int(configured_ai_no_line_brake_frames)))
+    configured_pid_gain_smoothing_alpha = max(0.0, min(1.0, float(configured_pid_gain_smoothing_alpha)))
+    configured_pid_steer_rate_limit = max(0.01, min(1.0, float(configured_pid_steer_rate_limit)))
     configured_line_process_interval_ms = max(20, min(300, int(configured_line_process_interval_ms)))
     configured_ai_control_interval_ms = max(20, min(300, int(configured_ai_control_interval_ms)))
     configured_ui_update_interval_ms = max(10, min(100, int(configured_ui_update_interval_ms)))
@@ -195,6 +211,8 @@ def load_config(
         ai_smoothing_alpha=configured_ai_smoothing_alpha,
         ai_no_line_hold_frames=configured_ai_no_line_hold_frames,
         ai_no_line_brake_frames=configured_ai_no_line_brake_frames,
+        pid_gain_smoothing_alpha=configured_pid_gain_smoothing_alpha,
+        pid_steer_rate_limit=configured_pid_steer_rate_limit,
         line_process_interval_ms=configured_line_process_interval_ms,
         ai_control_interval_ms=configured_ai_control_interval_ms,
         ui_update_interval_ms=configured_ui_update_interval_ms,
