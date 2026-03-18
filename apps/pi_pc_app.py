@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
 
-from ai_controller import LineTraceONNXController
+from pid_learned_controller import LearnedPIDONNXController
 from camera_receiver import CameraReceiver
 from config_loader import AppConfig, ensure_config_file, load_config, migrate_legacy_config_if_needed
 from control_logic import DriveParams, compute_dpad_command, compute_joystick_command
@@ -127,14 +127,15 @@ class UnifiedApp:
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
-        self.ai_controller = LineTraceONNXController(
+        self.ai_controller = LearnedPIDONNXController(
             history=10,
             smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             stop_on_no_line=True,
-            curve_slowdown_sensitivity=self.config.curve_slowdown_sensitivity,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
+            gain_smoothing_alpha=self.config.pid_gain_smoothing_alpha,
+            steer_rate_limit=self.config.pid_steer_rate_limit,
         )
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
