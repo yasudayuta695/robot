@@ -532,17 +532,18 @@ class CameraReceiver:
         features = self._default_line_features()
         debug_overlay_enabled = self.is_debug_overlay_enabled()
 
-        # 奥側を強めたいので、ROI上端を少し上げて取得範囲を広げる
-        roi_top = int(h * 0.03)
+        # 上部25%をカットして処理負荷を削減
+        roi_top = int(h * 0.25)
         mask, roi_h, far_threshold, near_threshold, intensity_mode = self._build_line_mask(
             vis=vis,
             roi_top=roi_top,
             frame_width=w,
         )
 
-        # 3分割ガイド（遠/中/近）
-        y1 = h // 3
-        y2 = (2 * h) // 3
+        # 3分割ガイド（遠/中/近）: ROI内を均等3分割
+        _roi_available = h - roi_top
+        y1 = roi_top + _roi_available // 3
+        y2 = roi_top + 2 * _roi_available // 3
         cv2.line(vis, (0, y1), (w - 1, y1), (120, 120, 120), 1)
         cv2.line(vis, (0, y2), (w - 1, y2), (120, 120, 120), 1)
         cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
@@ -755,7 +756,7 @@ class CameraReceiver:
         cfg = self.get_line_detection_config()
         width_med = float(np.median(valid_widths))
         width_p90 = float(np.percentile(valid_widths, 90))
-        near_anchor_global = int((2 * h) // 3)
+        near_anchor_global = y2
         near_anchor_row = int(np.clip(near_anchor_global - roi_top, 0, roi_h - 1))
         has_near_support = bool(np.any(valid_rows >= max(0, near_anchor_row - 10)))
         bottom_reach_ratio = float(valid_rows.max()) / max(1.0, float(roi_h - 1))
@@ -869,7 +870,7 @@ class CameraReceiver:
 
         # 遠/中/近 3点（固定深度位置で算出）
         zones = [
-            ("Far", "top", 0, y1, y1 // 2),
+            ("Far", "top", roi_top, y1, (roi_top + y1) // 2),
             ("Mid", "mid", y1, y2, (y1 + y2) // 2),
             ("Near", "bottom", y2, h, (y2 + h) // 2),
         ]
