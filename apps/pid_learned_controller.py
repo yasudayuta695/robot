@@ -13,6 +13,9 @@ class LearnedPIDONNXController:
         "line_offset_top",
         "line_offset_mid",
         "line_offset_bottom",
+        "line_width_top",
+        "line_width_mid",
+        "line_width_bottom",
     ]
 
     def __init__(
@@ -90,7 +93,7 @@ class LearnedPIDONNXController:
 
         for key in self.FEATURE_KEYS:
             raw = float(line_features.get(key, 0.0))
-            if key.startswith("line_detect"):
+            if key.startswith("line_detect") or key.startswith("line_width"):
                 values.append(float(np.clip(raw, 0.0, 1.0)))
             else:
                 values.append(float(np.clip(raw, -1.0, 1.0)))
@@ -115,10 +118,12 @@ class LearnedPIDONNXController:
             history_list = [history_list[0]] * pad_count + history_list
 
         flat = np.concatenate(history_list, axis=0).astype(np.float32)
-        return flat.reshape(1, self.history * 9)
+        frame_dim = len(self.FEATURE_KEYS) + 3  # +3: current_left, current_right, base_speed
+        return flat.reshape(1, self.history * frame_dim)
 
     def _pid_terms_from_window(self, window_flat: np.ndarray) -> Tuple[float, float, float, float, float]:
-        seq = np.asarray(window_flat, dtype=np.float32).reshape(self.history, 9)
+        frame_dim = len(self.FEATURE_KEYS) + 3  # +3: current_left, current_right, base_speed
+        seq = np.asarray(window_flat, dtype=np.float32).reshape(self.history, frame_dim)
         detect = np.clip(seq[:, 0:3], 0.0, 1.0)
         offset = np.clip(seq[:, 3:6], -1.0, 1.0)
         zone_weights = np.asarray([0.20, 0.35, 0.45], dtype=np.float32).reshape(1, 3)
@@ -137,7 +142,7 @@ class LearnedPIDONNXController:
         else:
             integral = 0.0
         derivative = float(effective_error[-1] - effective_error[-2]) if self.history >= 2 else 0.0
-        base_speed_norm = float(np.clip(seq[-1, 8], 0.0, 1.0))
+        base_speed_norm = float(np.clip(seq[-1, frame_dim - 1], 0.0, 1.0))
         detect_sum = float(np.sum(seq[-1, 0:3]))
 
         return error, integral, derivative, base_speed_norm, detect_sum
