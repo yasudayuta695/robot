@@ -26,6 +26,16 @@ FEATURE_COLUMNS = [
 
 TARGET_COLUMNS = ["target_left_norm", "target_right_norm"]
 
+# 左右反転に使うインデックス（FEATURE_COLUMNS の順序に依存）
+_FLIP_OFFSET_INDICES = [
+    FEATURE_COLUMNS.index("line_offset_top"),
+    FEATURE_COLUMNS.index("line_offset_mid"),
+    FEATURE_COLUMNS.index("line_offset_bottom"),
+]
+_FLIP_LEFT_IDX = FEATURE_COLUMNS.index("current_left_norm")
+_FLIP_RIGHT_IDX = FEATURE_COLUMNS.index("current_right_norm")
+_FRAME_DIM = len(FEATURE_COLUMNS)  # 9
+
 
 @dataclass
 class Sample:
@@ -47,6 +57,40 @@ def _clip_feature(name: str, value: float) -> float:
 
 def _clip_target(value: float) -> float:
     return float(np.clip(value, -1.0, 1.0))
+
+
+def _apply_flip_lr(
+    x: torch.Tensor, y: torch.Tensor, history: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """左右反転: offset を符号反転、left/right モーターを入れ替える。"""
+    x = x.clone()
+    y = y.clone()
+    for i in range(history):
+        base = i * _FRAME_DIM
+        for oi in _FLIP_OFFSET_INDICES:
+            x[base + oi] = -x[base + oi]
+        left_val = x[base + _FLIP_LEFT_IDX].clone()
+        x[base + _FLIP_LEFT_IDX] = x[base + _FLIP_RIGHT_IDX]
+        x[base + _FLIP_RIGHT_IDX] = left_val
+    y[0], y[1] = y[1].clone(), y[0].clone()
+    return x, y
+
+
+class _FlipAugDataset(Dataset):
+    """訓練用ラッパー: 50% の確率で左右反転を適用する。"""
+
+    def __init__(self, base: Dataset, history: int) -> None:
+        self._base = base
+        self._history = history
+
+    def __len__(self) -> int:
+        return len(self._base)  # type: ignore[arg-type]
+
+    def __getitem__(self, index: int):
+        x, y = self._base[index]
+        if torch.rand(1).item() < 0.5:
+            x, y = _apply_flip_lr(x, y, self._history)
+        return x, y
 
 
 def resolve_csv_paths(csv_path: str) -> List[str]:
@@ -520,6 +564,10 @@ def train(args: argparse.Namespace) -> None:
         if is_directory_input and len(csv_paths) == 1:
             print("[Warn] Only one CSV found under directory; session-level split is not applicable.")
 
+    if not args.no_augment:
+        train_set = _FlipAugDataset(train_set, history=args.history)
+        print("[Info] 左右反転データ拡張: ON (--no-augment で無効化)")
+
     input_dim = args.history * len(FEATURE_COLUMNS)
 
     if input_dim != 90:
@@ -716,6 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-restore-best", action="store_true", help="Do not restore best validation checkpoint")
     parser.add_argument("--curve-path", type=str, default="learning_curve.png", help="Output path for learning curve image")
     parser.add_argument("--no-curve", action="store_true", help="Disable saving learning curve image")
+    parser.add_argument("--no-augment", action="store_true", help="Disable left-right flip augmentation for training data")
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
