@@ -193,6 +193,9 @@ class CameraReceiver:
                         "line_offset_top": float(np.clip(float(prev.get("line_offset_top", 0.0)) * decay, -1.0, 1.0)),
                         "line_offset_mid": float(np.clip(float(prev.get("line_offset_mid", 0.0)) * decay, -1.0, 1.0)),
                         "line_offset_bottom": float(np.clip(float(prev.get("line_offset_bottom", 0.0)) * decay, -1.0, 1.0)),
+                        "line_width_top": float(np.clip(float(prev.get("line_width_top", 0.0)) * decay, 0.0, 1.0)),
+                        "line_width_mid": float(np.clip(float(prev.get("line_width_mid", 0.0)) * decay, 0.0, 1.0)),
+                        "line_width_bottom": float(np.clip(float(prev.get("line_width_bottom", 0.0)) * decay, 0.0, 1.0)),
                     }
 
             self._latest_line_features = incoming

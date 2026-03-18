@@ -308,17 +308,27 @@ class DrivingLogSequenceDataset(Dataset):
         if len(self.index_map) == 0:
             raise ValueError("No usable rows found in provided csv path(s)")
 
+    # width カラムは新規収集データにのみ存在する。古いデータとの互換のため
+    # 欠損時は 0.0 で補完する（警告のみ）。
+    _OPTIONAL_COLUMNS = frozenset(["line_width_top", "line_width_mid", "line_width_bottom"])
+
     def _load_csv(self, csv_path: str) -> List[Sample]:
         loaded: List[Sample] = []
         with open(csv_path, "r", newline="") as f:
             reader = csv.DictReader(f)
-            missing_cols = [c for c in (self.feature_columns + TARGET_COLUMNS) if c not in (reader.fieldnames or [])]
-            if missing_cols:
-                raise ValueError(f"CSV is missing required columns: {missing_cols}")
+            fieldnames = set(reader.fieldnames or [])
+            required = [c for c in (self.feature_columns + TARGET_COLUMNS) if c not in self._OPTIONAL_COLUMNS]
+            missing_required = [c for c in required if c not in fieldnames]
+            if missing_required:
+                raise ValueError(f"CSV is missing required columns: {missing_required}")
+
+            missing_optional = [c for c in self.feature_columns if c in self._OPTIONAL_COLUMNS and c not in fieldnames]
+            if missing_optional:
+                print(f"[Warn] {os.path.basename(os.path.dirname(csv_path))}: optional columns missing (filled with 0): {missing_optional}")
 
             for row_idx, row in enumerate(reader):
                 try:
-                    feature_vals = [_clip_feature(c, float(row[c])) for c in self.feature_columns]
+                    feature_vals = [_clip_feature(c, float(row[c]) if c in fieldnames else 0.0) for c in self.feature_columns]
                     target_vals = [_clip_target(float(row[c])) for c in TARGET_COLUMNS]
                 except (TypeError, ValueError) as e:
                     raise ValueError(f"Invalid numeric value at row {row_idx + 2}: {e}") from e
