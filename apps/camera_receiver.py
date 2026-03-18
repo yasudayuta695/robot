@@ -917,6 +917,11 @@ class CameraReceiver:
         cam_socket.setsockopt(zmq.CONFLATE, 1)
         cam_socket.connect(f"tcp://{self.pi_ip}:{self.camera_port}")
 
+        frame_sizes = {
+            320 * 240 * 3: (240, 320),
+            640 * 480 * 3: (480, 640),
+        }
+
         try:
             while self._running:
                 try:
@@ -925,9 +930,15 @@ class CameraReceiver:
                     time.sleep(0.01)
                     continue
                 try:
-                    img = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
+                    shape_hw = frame_sizes.get(len(data))
+                    if shape_hw is None:
+                        self.logger.debug("Unexpected frame size: %d", len(data))
+                        continue
+                    h, w = shape_hw
+                    img = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    img = cv2.resize(img, (640, 480))
+                    if (w, h) != (640, 480):
+                        img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_LINEAR)
                     with self._lock:
                         self._image = img
                 except Exception as exc:

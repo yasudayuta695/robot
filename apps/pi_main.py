@@ -33,6 +33,11 @@ MOTOR_RIGHT_SIGN = 1
 MA_IN1, MA_IN2, MA_PWM = 19, 21, 23
 MB_IN1, MB_IN2, MB_PWM = 15, 13, 11
 
+CAMERA_PROFILE_LOW_LATENCY = "low_latency"
+CAMERA_PROFILE_HIGH_QUALITY = "high_quality"
+CAMERA_FRAME_SIZE_LOW_LATENCY = (320, 240)
+CAMERA_FRAME_SIZE_HIGH_QUALITY = (640, 480)
+
 
 def setup_gpio() -> Tuple[GPIO.PWM, GPIO.PWM]:
     GPIO.setmode(GPIO.BOARD)
@@ -119,6 +124,7 @@ class PiRuntimeConfig:
     ai_control_interval_ms: int = 100
     line_color_space: str = "lab"
     line_detection_profile: str = "default"
+    camera_stream_profile: str = CAMERA_PROFILE_LOW_LATENCY
     far_threshold: int = 100
     near_threshold: int = 70
     auto_threshold_enabled: bool = True
@@ -141,6 +147,13 @@ def _parse_bool(text: str) -> Optional[bool]:
     if lowered in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _resolve_camera_frame_size(profile_name: str) -> Tuple[int, int]:
+    profile = str(profile_name).strip().lower()
+    if profile == CAMERA_PROFILE_HIGH_QUALITY:
+        return CAMERA_FRAME_SIZE_HIGH_QUALITY
+    return CAMERA_FRAME_SIZE_LOW_LATENCY
 
 
 class PIDController:
@@ -232,6 +245,8 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
                     cfg.line_color_space = str(value).strip().lower()
                 elif key == "line_detection_profile":
                     cfg.line_detection_profile = str(value).strip().lower()
+                elif key == "camera_stream_profile":
+                    cfg.camera_stream_profile = str(value).strip().lower()
                 elif key == "far_threshold":
                     cfg.far_threshold = int(float(value))
                 elif key == "near_threshold":
@@ -273,6 +288,8 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
     cfg.ai_control_interval_ms = int(np.clip(cfg.ai_control_interval_ms, 20, 300))
     cfg.line_color_space = "hsv" if str(cfg.line_color_space).strip().lower() == "hsv" else "lab"
     cfg.line_detection_profile = str(cfg.line_detection_profile).strip().lower() or "default"
+    if str(cfg.camera_stream_profile).strip().lower() != CAMERA_PROFILE_HIGH_QUALITY:
+        cfg.camera_stream_profile = CAMERA_PROFILE_LOW_LATENCY
     cfg.far_threshold = int(np.clip(cfg.far_threshold, 0, 255))
     cfg.near_threshold = int(np.clip(cfg.near_threshold, 0, 255))
     cfg.pid_output_limit = float(np.clip(cfg.pid_output_limit, 0.05, 2.5))
@@ -290,6 +307,7 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
 
     print(f"[pid] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    cam_w, cam_h = _resolve_camera_frame_size(runtime_cfg.camera_stream_profile)
     motor_left_sign = int(runtime_cfg.motor_left_sign)
     motor_right_sign = int(runtime_cfg.motor_right_sign)
 
@@ -329,7 +347,9 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
 
     print("[pid] Initializing camera...")
     picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+    cam_conf = picam2.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"}
+    )
     picam2.configure(cam_conf)
     picam2.start()
     picam2.set_controls(
@@ -356,7 +376,6 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
             now = time.perf_counter()
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -399,7 +418,9 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
         picam2.stop()
 
 
-def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None:
+def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_path: str) -> None:
+    runtime_cfg = load_runtime_config(config_path)
+    cam_w, cam_h = _resolve_camera_frame_size(runtime_cfg.camera_stream_profile)
     running = True
 
     def camera_thread() -> None:
@@ -411,7 +432,9 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None
 
         print("[remote] Initializing camera...")
         picam2 = Picamera2()
-        config = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+        config = picam2.create_video_configuration(
+            main={"size": (cam_w, cam_h), "format": "RGB888"}
+        )
         picam2.configure(config)
         picam2.start()
         picam2.set_controls(
@@ -472,6 +495,7 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
     print(f"[local_ai] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    cam_w, cam_h = _resolve_camera_frame_size(runtime_cfg.camera_stream_profile)
     motor_left_sign = int(runtime_cfg.motor_left_sign)
     motor_right_sign = int(runtime_cfg.motor_right_sign)
 
@@ -515,7 +539,9 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
     print("[local_ai] Initializing camera...")
     picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+    cam_conf = picam2.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"}
+    )
     picam2.configure(cam_conf)
     picam2.start()
     picam2.set_controls(
@@ -543,7 +569,6 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -583,6 +608,7 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
     print(f"[pid_learned] Loading runtime config: {args.config_path}")
     runtime_cfg = load_runtime_config(args.config_path)
+    cam_w, cam_h = _resolve_camera_frame_size(runtime_cfg.camera_stream_profile)
     motor_left_sign = int(runtime_cfg.motor_left_sign)
     motor_right_sign = int(runtime_cfg.motor_right_sign)
 
@@ -628,7 +654,9 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
     print("[pid_learned] Initializing camera...")
     picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+    cam_conf = picam2.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"}
+    )
     picam2.configure(cam_conf)
     picam2.start()
     picam2.set_controls(
@@ -649,7 +677,6 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -748,6 +775,6 @@ if __name__ == "__main__":
         elif args.mode == "pid_learned":
             run_pid_learned_mode(args, pwm_a, pwm_b)
         else:
-            run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps)
+            run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps, config_path=args.config_path)
     finally:
         safe_shutdown_gpio(pwm_a, pwm_b)

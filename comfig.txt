@@ -20,6 +20,9 @@ ai_no_line_hold_frames=4
 ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
 line_process_interval_ms=70
+# カメラ配信プロファイル（low_latency / high_quality）
+# 低遅延重視は low_latency，画質重視は high_quality
+camera_stream_profile=low_latency
 # ライン抽出の色空間（lab または hsv）
 line_color_space=hsv
 # ライン検出プロファイル（default=panel_seam_glare / panel_seam / glare / panel_seam_glare）
