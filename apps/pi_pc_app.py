@@ -1,10 +1,12 @@
 import logging
 import os
+import threading
 import tkinter as tk
 import time
 import cv2
+import numpy as np
 from tkinter import messagebox, ttk
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
 
@@ -41,6 +43,46 @@ EMERGENCY_STOP_KEYS = {"space", "Escape"}
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+class _LineDetectionWorker:
+    """find_line() をバックグラウンドスレッドで実行し、UIスレッドのブロックを防ぐ。"""
+
+    def __init__(self, camera_receiver: CameraReceiver, interval_sec: float) -> None:
+        self._camera_receiver = camera_receiver
+        self._interval = max(0.02, float(interval_sec))
+        self._lock = threading.Lock()
+        self._latest_vis: Optional[np.ndarray] = None
+        self._latest_features: Dict[str, float] = camera_receiver.get_latest_line_features()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while self._running:
+            frame = self._camera_receiver.get_latest_frame()
+            vis = self._camera_receiver.find_line(frame)
+            features = self._camera_receiver.get_latest_line_features()
+            with self._lock:
+                self._latest_vis = vis
+                self._latest_features = features
+            time.sleep(self._interval)
+
+    def get_latest(self) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
+        with self._lock:
+            vis = self._latest_vis.copy() if self._latest_vis is not None else None
+            return vis, self._latest_features.copy()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class UnifiedApp:
@@ -97,10 +139,15 @@ class UnifiedApp:
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
         self.ui_update_interval_ms = max(10, int(self.config.ui_update_interval_ms))
-        self._last_line_process_time = 0.0
         self._last_ai_control_time = 0.0
         self._cached_line_vis = None
         self._cached_line_features = self.camera_receiver.get_latest_line_features()
+
+        self._line_worker = _LineDetectionWorker(
+            camera_receiver=self.camera_receiver,
+            interval_sec=self.line_process_interval_sec,
+        )
+        self._line_worker.start()
         self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
         self._ai_error_logged = False
 
@@ -603,7 +650,6 @@ class UnifiedApp:
         self.send_command(0, 0)
         self.reset_ai_state()
         self._last_ai_control_time = 0.0
-        self._last_line_process_time = 0.0
         self.canvas.coords(
             self.stick,
             CENTER - STICK_RADIUS,
@@ -719,15 +765,11 @@ class UnifiedApp:
         frame = self.camera_receiver.get_latest_frame()
         now = time.perf_counter()
 
-        should_process_line = (
-            self._cached_line_vis is None
-            or (now - self._last_line_process_time) >= self.line_process_interval_sec
-        )
-        if should_process_line:
-            line_vis = self.camera_receiver.find_line(frame)
-            self._cached_line_vis = line_vis if line_vis is not None else frame
-            self._cached_line_features = self.camera_receiver.get_latest_line_features()
-            self._last_line_process_time = now
+        # バックグラウンドスレッドから最新のライン検出結果を取得
+        line_vis, line_features_from_worker = self._line_worker.get_latest()
+        if line_vis is not None:
+            self._cached_line_vis = line_vis
+            self._cached_line_features = line_features_from_worker
 
         display_src = self._cached_line_vis if self._cached_line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
@@ -830,6 +872,7 @@ class UnifiedApp:
         self.send_command(0, 0)
 
     def on_closing(self) -> None:
+        self._line_worker.stop()
         self.recorder.close_and_discard_on_exit()
         self.camera_receiver.stop()
         self.motor_client.close()

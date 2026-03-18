@@ -526,6 +526,56 @@ class CameraReceiver:
                 break
         return soft_best_score, int(soft_best_idx), soft_best_cnt, contour_entries
 
+    def _precompute_row_segments(
+        self,
+        target_mask: np.ndarray,
+        frame_width: int,
+    ) -> Dict[int, list[tuple[float, float, int, int]]]:
+        """target_mask の全行セグメント (cx, width, xmin, xmax) を一括計算する。"""
+        roi_h = target_mask.shape[0]
+        ys, xs = np.nonzero(target_mask)
+        if ys.size == 0:
+            return {}
+
+        # 行ごとの最大許容セグメント幅をベクトル化計算
+        all_rows = np.arange(roi_h, dtype=np.float64)
+        t = all_rows / max(1.0, float(roi_h - 1))
+        base_ratio = 0.18 + 0.22 * t
+        relax = min(0.10, 0.025 * float(self._consecutive_misses))
+        ratio = np.clip(base_ratio + relax, 0.16, 0.52)
+        max_widths = np.clip((ratio * float(frame_width)).astype(np.int32), 8, 260)
+
+        unique_rows, starts, counts = np.unique(ys, return_index=True, return_counts=True)
+        result: Dict[int, list[tuple[float, float, int, int]]] = {}
+        for i in range(unique_rows.size):
+            r = int(unique_rows[i])
+            row_xs = xs[starts[i]:starts[i] + counts[i]]
+            if row_xs.size < 2:
+                continue
+
+            max_w = int(max_widths[r])
+            gaps = np.where(np.diff(row_xs) > 1)[0] + 1
+            bounds = np.empty(gaps.size + 2, dtype=np.intp)
+            bounds[0] = 0
+            bounds[1:gaps.size + 1] = gaps
+            bounds[-1] = row_xs.size
+
+            segs: list[tuple[float, float, int, int]] = []
+            for j in range(bounds.size - 1):
+                seg_slice = row_xs[bounds[j]:bounds[j + 1]]
+                if seg_slice.size < 2:
+                    continue
+                x_min = int(seg_slice[0])
+                x_max = int(seg_slice[-1])
+                seg_w = x_max - x_min
+                if seg_w <= 1 or seg_w > max_w:
+                    continue
+                segs.append((0.5 * (x_min + x_max), float(seg_w), x_min, x_max))
+
+            if segs:
+                result[r] = segs
+        return result
+
     def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
         vis = img.copy()
         h, w = vis.shape[:2]
@@ -596,34 +646,8 @@ class CameraReceiver:
         seed_x = float(self._prev_center_x) if self._prev_center_x is not None else (w * 0.5)
         seed_x = float(np.clip(seed_x, 0.0, float(w - 1)))
 
-        def max_segment_width_px(row_index: int) -> int:
-            t = float(row_index) / max(1.0, float(roi_h - 1))
-            base_ratio = 0.18 + (0.22 * t)
-            relax_ratio = min(0.10, 0.025 * float(self._consecutive_misses))
-            ratio = float(np.clip(base_ratio + relax_ratio, 0.16, 0.52))
-            return int(np.clip(int(ratio * float(w)), 8, 260))
-
-        def row_segments(row_index: int, row: np.ndarray) -> list[tuple[float, float, int, int]]:
-            xs = np.flatnonzero(row > 0)
-            if xs.size < 2:
-                return []
-            split_idx = np.where(np.diff(xs) > 1)[0] + 1
-            segments = np.split(xs, split_idx)
-            result: list[tuple[float, float, int, int]] = []
-            max_seg_w = max_segment_width_px(row_index)
-            for seg in segments:
-                if seg.size < 2:
-                    continue
-                x_min = int(seg[0])
-                x_max = int(seg[-1])
-                seg_w = x_max - x_min
-                if seg_w <= 1:
-                    continue
-                if seg_w > max_seg_w:
-                    continue
-                cx = 0.5 * (x_min + x_max)
-                result.append((float(cx), float(seg_w), x_min, x_max))
-            return result
+        # 全行のセグメント情報を一括計算（行ごとのNumPy呼び出しを排除）
+        all_row_segs = self._precompute_row_segments(target_mask, w)
 
         seed_center_row = int(np.clip(roi_h * 0.52, 0, roi_h - 1))
         seed_r0 = max(0, seed_center_row - 30)
@@ -632,7 +656,7 @@ class CameraReceiver:
         best_seed = None
         best_seed_cost = float("inf")
         for r in range(seed_r0, seed_r1):
-            segs = row_segments(r, target_mask[r, :])
+            segs = all_row_segs.get(r, [])
             for cx, seg_w, x_min, x_max in segs:
                 width_cost = max(0.0, seg_w - (0.45 * float(w))) * 0.20
                 border_penalty = 20.0 if (x_min <= 1 or x_max >= (w - 2)) else 0.0
@@ -665,7 +689,7 @@ class CameraReceiver:
 
             end = roi_h if step > 0 else -1
             for r in range(start_row, end, step):
-                segs = row_segments(r, target_mask[r, :])
+                segs = all_row_segs.get(r, [])
                 if not segs:
                     misses += 1
                     if misses > max_misses:
