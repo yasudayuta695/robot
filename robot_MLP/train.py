@@ -26,15 +26,10 @@ FEATURE_COLUMNS = [
 
 TARGET_COLUMNS = ["target_left_norm", "target_right_norm"]
 
-# 左右反転に使うインデックス（FEATURE_COLUMNS の順序に依存）
-_FLIP_OFFSET_INDICES = [
-    FEATURE_COLUMNS.index("line_offset_top"),
-    FEATURE_COLUMNS.index("line_offset_mid"),
-    FEATURE_COLUMNS.index("line_offset_bottom"),
+# モーターフィードバックなし版（current_left/right_norm を除外）
+FEATURE_COLUMNS_NO_MOTOR = [
+    c for c in FEATURE_COLUMNS if c not in ("current_left_norm", "current_right_norm")
 ]
-_FLIP_LEFT_IDX = FEATURE_COLUMNS.index("current_left_norm")
-_FLIP_RIGHT_IDX = FEATURE_COLUMNS.index("current_right_norm")
-_FRAME_DIM = len(FEATURE_COLUMNS)  # 9
 
 
 @dataclass
@@ -60,18 +55,28 @@ def _clip_target(value: float) -> float:
 
 
 def _apply_flip_lr(
-    x: torch.Tensor, y: torch.Tensor, history: int
+    x: torch.Tensor,
+    y: torch.Tensor,
+    history: int,
+    feature_columns: List[str],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """左右反転: offset を符号反転、left/right モーターを入れ替える。"""
+    frame_dim = len(feature_columns)
+    offset_indices = [feature_columns.index(c) for c in ("line_offset_top", "line_offset_mid", "line_offset_bottom")]
+    has_motor = "current_left_norm" in feature_columns
+    left_idx = feature_columns.index("current_left_norm") if has_motor else -1
+    right_idx = feature_columns.index("current_right_norm") if has_motor else -1
+
     x = x.clone()
     y = y.clone()
     for i in range(history):
-        base = i * _FRAME_DIM
-        for oi in _FLIP_OFFSET_INDICES:
+        base = i * frame_dim
+        for oi in offset_indices:
             x[base + oi] = -x[base + oi]
-        left_val = x[base + _FLIP_LEFT_IDX].clone()
-        x[base + _FLIP_LEFT_IDX] = x[base + _FLIP_RIGHT_IDX]
-        x[base + _FLIP_RIGHT_IDX] = left_val
+        if has_motor:
+            left_val = x[base + left_idx].clone()
+            x[base + left_idx] = x[base + right_idx]
+            x[base + right_idx] = left_val
     y[0], y[1] = y[1].clone(), y[0].clone()
     return x, y
 
@@ -79,9 +84,10 @@ def _apply_flip_lr(
 class _FlipAugDataset(Dataset):
     """訓練用ラッパー: 50% の確率で左右反転を適用する。"""
 
-    def __init__(self, base: Dataset, history: int) -> None:
+    def __init__(self, base: Dataset, history: int, feature_columns: List[str]) -> None:
         self._base = base
         self._history = history
+        self._feature_columns = feature_columns
 
     def __len__(self) -> int:
         return len(self._base)  # type: ignore[arg-type]
@@ -89,7 +95,7 @@ class _FlipAugDataset(Dataset):
     def __getitem__(self, index: int):
         x, y = self._base[index]
         if torch.rand(1).item() < 0.5:
-            x, y = _apply_flip_lr(x, y, self._history)
+            x, y = _apply_flip_lr(x, y, self._history, self._feature_columns)
         return x, y
 
 
@@ -268,13 +274,19 @@ class DrivingLogSequenceDataset(Dataset):
     replicating frame 0 (no zero padding).
     """
 
-    def __init__(self, csv_paths: Sequence[str], history: int = 10) -> None:
+    def __init__(
+        self,
+        csv_paths: Sequence[str],
+        history: int = 10,
+        feature_columns: List[str] = FEATURE_COLUMNS,
+    ) -> None:
         if history <= 0:
             raise ValueError("history must be >= 1")
         if not csv_paths:
             raise ValueError("csv_paths is empty")
 
         self.history = history
+        self.feature_columns = feature_columns
         self.sequence_sources: List[str] = []
         self.sequences: List[List[Sample]] = []
         self.index_map: List[Tuple[int, int]] = []
@@ -295,13 +307,13 @@ class DrivingLogSequenceDataset(Dataset):
         loaded: List[Sample] = []
         with open(csv_path, "r", newline="") as f:
             reader = csv.DictReader(f)
-            missing_cols = [c for c in (FEATURE_COLUMNS + TARGET_COLUMNS) if c not in (reader.fieldnames or [])]
+            missing_cols = [c for c in (self.feature_columns + TARGET_COLUMNS) if c not in (reader.fieldnames or [])]
             if missing_cols:
                 raise ValueError(f"CSV is missing required columns: {missing_cols}")
 
             for row_idx, row in enumerate(reader):
                 try:
-                    feature_vals = [_clip_feature(c, float(row[c])) for c in FEATURE_COLUMNS]
+                    feature_vals = [_clip_feature(c, float(row[c])) for c in self.feature_columns]
                     target_vals = [_clip_target(float(row[c])) for c in TARGET_COLUMNS]
                 except (TypeError, ValueError) as e:
                     raise ValueError(f"Invalid numeric value at row {row_idx + 2}: {e}") from e
@@ -386,8 +398,13 @@ class PIDGainMLP(nn.Module):
         return torch.sigmoid(raw) * scales
 
 
-def pid_terms_from_input(x: torch.Tensor, history: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    frame_dim = len(FEATURE_COLUMNS)
+def pid_terms_from_input(
+    x: torch.Tensor,
+    history: int,
+    feature_columns: List[str] = FEATURE_COLUMNS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    frame_dim = len(feature_columns)
+    base_speed_idx = feature_columns.index("base_speed_norm")
     if x.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got shape={tuple(x.shape)}")
     if x.size(1) != history * frame_dim:
@@ -418,15 +435,23 @@ def pid_terms_from_input(x: torch.Tensor, history: int) -> tuple[torch.Tensor, t
         derivative = effective_error[:, -1] - effective_error[:, -2]
     else:
         derivative = torch.zeros_like(error)
-    base_speed_norm = torch.clamp(seq[:, -1, 8], 0.0, 1.0)
+    base_speed_norm = torch.clamp(seq[:, -1, base_speed_idx], 0.0, 1.0)
     return error, integral, derivative, base_speed_norm
 
 
-def motor_from_gains(gains: torch.Tensor, x: torch.Tensor, history: int, steer_limit: float) -> torch.Tensor:
+def motor_from_gains(
+    gains: torch.Tensor,
+    x: torch.Tensor,
+    history: int,
+    steer_limit: float,
+    feature_columns: List[str] = FEATURE_COLUMNS,
+) -> torch.Tensor:
     if gains.dim() != 2 or gains.size(1) != 3:
         raise ValueError(f"Expected gain tensor shape=(N,3), got {tuple(gains.shape)}")
 
-    error, integral, derivative, base_speed_norm = pid_terms_from_input(x, history=history)
+    error, integral, derivative, base_speed_norm = pid_terms_from_input(
+        x, history=history, feature_columns=feature_columns
+    )
     kp = gains[:, 0]
     ki = gains[:, 1]
     kd = gains[:, 2]
@@ -460,6 +485,7 @@ def evaluate(
     history: int,
     steer_limit: float,
     gain_l2: float,
+    feature_columns: List[str] = FEATURE_COLUMNS,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -470,7 +496,7 @@ def evaluate(
             y = y.to(device)
             if target_mode == "pid-gain":
                 gains = model(x)
-                pred = motor_from_gains(gains, x=x, history=history, steer_limit=steer_limit)
+                pred = motor_from_gains(gains, x=x, history=history, steer_limit=steer_limit, feature_columns=feature_columns)
                 loss = criterion(pred, y)
                 if gain_l2 > 0.0:
                     loss = loss + (gain_l2 * torch.mean(gains * gains))
@@ -524,6 +550,9 @@ def save_learning_curve(train_losses: Sequence[float], val_losses: Sequence[floa
 
 
 def train(args: argparse.Namespace) -> None:
+    feature_columns = FEATURE_COLUMNS_NO_MOTOR if args.no_motor_feedback else FEATURE_COLUMNS
+    print(f"[Info] feature_columns ({len(feature_columns)}次元): {feature_columns}")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -543,8 +572,8 @@ def train(args: argparse.Namespace) -> None:
         if len(train_csvs) == 0:
             raise ValueError("No training CSVs after split. Check dataset size and split ratios.")
 
-        train_set = DrivingLogSequenceDataset(csv_paths=train_csvs, history=args.history)
-        val_set = DrivingLogSequenceDataset(csv_paths=val_csvs, history=args.history) if len(val_csvs) > 0 else None
+        train_set = DrivingLogSequenceDataset(csv_paths=train_csvs, history=args.history, feature_columns=feature_columns)
+        val_set = DrivingLogSequenceDataset(csv_paths=val_csvs, history=args.history, feature_columns=feature_columns) if len(val_csvs) > 0 else None
         print(
             f"Loaded {len(csv_paths)} csv file(s) from directory. "
             f"holdout_unit={args.holdout_unit} "
@@ -554,7 +583,7 @@ def train(args: argparse.Namespace) -> None:
         if args.split_report_path:
             save_split_report(args.split_report_path, train_csvs, val_csvs, test_csvs)
     else:
-        dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history)
+        dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history, feature_columns=feature_columns)
         print(f"Loaded {len(csv_paths)} csv file(s), total rows={len(dataset)}")
 
         train_idx, val_idx = split_indices_sequential(len(dataset), args.val_ratio)
@@ -565,13 +594,13 @@ def train(args: argparse.Namespace) -> None:
             print("[Warn] Only one CSV found under directory; session-level split is not applicable.")
 
     if not args.no_augment:
-        train_set = _FlipAugDataset(train_set, history=args.history)
+        train_set = _FlipAugDataset(train_set, history=args.history, feature_columns=feature_columns)
         print("[Info] 左右反転データ拡張: ON (--no-augment で無効化)")
 
-    input_dim = args.history * len(FEATURE_COLUMNS)
+    input_dim = args.history * len(feature_columns)
 
     if input_dim != 90:
-        print(f"[Info] input_dim={input_dim}. Requirement is 90 when history=10.")
+        print(f"[Info] input_dim={input_dim} (history={args.history} x {len(feature_columns)}次元/frame).")
 
     train_loader = DataLoader(
         train_set,
@@ -629,7 +658,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad()
             if args.target_mode == "pid-gain":
                 gains = model(x)
-                pred = motor_from_gains(gains, x=x, history=args.history, steer_limit=args.steer_limit)
+                pred = motor_from_gains(gains, x=x, history=args.history, steer_limit=args.steer_limit, feature_columns=feature_columns)
                 loss = criterion(pred, y)
                 if args.gain_l2 > 0.0:
                     loss = loss + (args.gain_l2 * torch.mean(gains * gains))
@@ -656,6 +685,7 @@ def train(args: argparse.Namespace) -> None:
                 history=args.history,
                 steer_limit=args.steer_limit,
                 gain_l2=args.gain_l2,
+                feature_columns=feature_columns,
             )
             val_losses.append(val_loss)
 
@@ -765,6 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curve-path", type=str, default="learning_curve.png", help="Output path for learning curve image")
     parser.add_argument("--no-curve", action="store_true", help="Disable saving learning curve image")
     parser.add_argument("--no-augment", action="store_true", help="Disable left-right flip augmentation for training data")
+    parser.add_argument("--no-motor-feedback", action="store_true", help="Exclude current_left_norm/current_right_norm from features (input: history x 7)")
     parser.add_argument("--seed", type=int, default=42)
     return parser
 

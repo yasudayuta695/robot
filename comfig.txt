@@ -55,7 +55,8 @@ motor_right_sign=1
 # カメラ選択肢
 camera_id=camera_1
 camera_id=camera_2
-default_camera_id=camera_1
+camera_id=camera_3
+default_camera_id=camera_3
 
 # 走行種別は drive_type= で複数行書けます
 drive_type=straight
