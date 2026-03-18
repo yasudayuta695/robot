@@ -20,6 +20,8 @@ ai_no_line_hold_frames=4
 ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
 line_process_interval_ms=70
+# ライン抽出の色空間（lab または hsv）
+line_color_space=hsv
 # しきい値自動補正（見失いが多い場合は true 推奨）
 auto_threshold_enabled=true
 # AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100

@@ -117,6 +117,7 @@ class PiRuntimeConfig:
     ai_no_line_brake_frames: int = 8
     line_process_interval_ms: int = 70
     ai_control_interval_ms: int = 100
+    line_color_space: str = "lab"
     far_threshold: int = 100
     near_threshold: int = 70
     auto_threshold_enabled: bool = True
@@ -226,6 +227,8 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
                     cfg.line_process_interval_ms = int(float(value))
                 elif key == "ai_control_interval_ms":
                     cfg.ai_control_interval_ms = int(float(value))
+                elif key == "line_color_space":
+                    cfg.line_color_space = str(value).strip().lower()
                 elif key == "far_threshold":
                     cfg.far_threshold = int(float(value))
                 elif key == "near_threshold":
@@ -265,6 +268,7 @@ def load_runtime_config(config_path: str) -> PiRuntimeConfig:
     cfg.ai_no_line_brake_frames = int(np.clip(cfg.ai_no_line_brake_frames, 1, 120))
     cfg.line_process_interval_ms = int(np.clip(cfg.line_process_interval_ms, 20, 300))
     cfg.ai_control_interval_ms = int(np.clip(cfg.ai_control_interval_ms, 20, 300))
+    cfg.line_color_space = "hsv" if str(cfg.line_color_space).strip().lower() == "hsv" else "lab"
     cfg.far_threshold = int(np.clip(cfg.far_threshold, 0, 255))
     cfg.near_threshold = int(np.clip(cfg.near_threshold, 0, 255))
     cfg.pid_output_limit = float(np.clip(cfg.pid_output_limit, 0.05, 2.5))
@@ -287,6 +291,7 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_line_color_space(runtime_cfg.line_color_space)
     line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),
@@ -472,6 +477,7 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_line_color_space(runtime_cfg.line_color_space)
     line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),
@@ -580,6 +586,7 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
     line_detector = CameraReceiver("127.0.0.1", 0, logger)
     line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_line_color_space(runtime_cfg.line_color_space)
     line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
     line_detector.set_thresholds(
         far_threshold=int(runtime_cfg.far_threshold),

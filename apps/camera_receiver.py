@@ -18,6 +18,7 @@ class CameraReceiver:
         self._latest_line_features = self._default_line_features()
         self._far_threshold = 100
         self._near_threshold = 70
+        self._line_color_space = "lab"
         self._auto_threshold_enabled = False
         self._debug_overlay_enabled = True
         self._prev_center_x: Optional[float] = None
@@ -185,6 +186,37 @@ class CameraReceiver:
                 self._near_threshold = int(np.clip(int(near_threshold), 0, 255))
             return self._far_threshold, self._near_threshold
 
+    def get_line_color_space(self) -> str:
+        with self._lock:
+            return str(self._line_color_space)
+
+    def set_line_color_space(self, mode: str) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized not in {"lab", "hsv"}:
+            normalized = "lab"
+        with self._lock:
+            self._line_color_space = normalized
+            return str(self._line_color_space)
+
+    def _prepare_intensity_channel(self, roi: np.ndarray) -> Tuple[np.ndarray, str]:
+        mode = self.get_line_color_space()
+
+        if mode == "hsv":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            v_chan = hsv[:, :, 2]
+            clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
+            norm_v = clahe.apply(v_chan)
+            blur = cv2.GaussianBlur(norm_v, (5, 5), 0)
+            return blur, "HSV-V"
+
+        # Default: LAB L-channel preprocessing.
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        l_chan = lab[:, :, 0]
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
+        norm_l = clahe.apply(l_chan)
+        blur = cv2.GaussianBlur(norm_l, (5, 5), 0)
+        return blur, "LAB-L"
+
     def _resolve_thresholds(self, blur: np.ndarray, far_split: int) -> Tuple[int, int]:
         with self._lock:
             far_threshold = int(self._far_threshold)
@@ -253,12 +285,8 @@ class CameraReceiver:
         roi_top = int(h * 0.03)
         roi = vis[roi_top:, :]
 
-        # 照明ムラ対策: LチャネルにCLAHEをかけて局所コントラストを補正
-        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-        l_chan = lab[:, :, 0]
-        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
-        norm_l = clahe.apply(l_chan)
-        blur = cv2.GaussianBlur(norm_l, (5, 5), 0)
+        # 照明ムラ対策: 設定された色空間の輝度系チャネルをCLAHEで補正
+        blur, intensity_mode = self._prepare_intensity_channel(roi)
         roi_h = blur.shape[0]
         far_split = int(roi_h * 0.45)
 
@@ -340,7 +368,7 @@ class CameraReceiver:
         cv2.putText(vis, "Near", (8, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
         cv2.putText(
             vis,
-            f"th_far={far_threshold} th_near={near_threshold}",
+            f"{intensity_mode} th_far={far_threshold} th_near={near_threshold}",
             (10, h - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
