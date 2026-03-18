@@ -41,10 +41,10 @@ class ContourRuleConfig:
     edge_blob_span_ratio_min: float = 0.30
     edge_blob_aspect_max: float = 1.85
 
-    edge_strip_bw_ratio_max: float = 0.05
-    edge_strip_span_ratio_min: float = 0.65
+    edge_strip_bw_ratio_max: float = 0.20
+    edge_strip_span_ratio_min: float = 0.55
     edge_strip_fill_ratio_min: float = 0.30
-    edge_strip_aspect_min: float = 3.4
+    edge_strip_aspect_min: float = 2.5
 
     full_span_bw_ratio_min: float = 0.25
 

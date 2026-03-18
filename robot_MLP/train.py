@@ -19,6 +19,9 @@ FEATURE_COLUMNS = [
     "line_offset_top",
     "line_offset_mid",
     "line_offset_bottom",
+    "line_width_top",
+    "line_width_mid",
+    "line_width_bottom",
     "current_left_norm",
     "current_right_norm",
     "base_speed_norm",
@@ -43,6 +46,8 @@ def _clip_feature(name: str, value: float) -> float:
         return float(np.clip(value, 0.0, 1.0))
     if name.startswith("line_offset"):
         return float(np.clip(value, -1.0, 1.0))
+    if name.startswith("line_width"):
+        return float(np.clip(value, 0.0, 1.0))
     if name in ("current_left_norm", "current_right_norm"):
         return float(np.clip(value, -1.0, 1.0))
     if name == "base_speed_norm":

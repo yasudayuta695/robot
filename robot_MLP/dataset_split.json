@@ -19,6 +19,13 @@
     "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_223159_181750/driving_log.csv",
     "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_223216_997730/driving_log.csv"
   ],
-  "val": [],
+  "val": [
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230451_930158/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230516_324041/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230550_440463/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230624_699415/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230719_791921/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/dataset/camera_3/straight/20260318_230746_157369/driving_log.csv"
+  ],
   "test": []
 }

@@ -45,9 +45,9 @@ pid_integral_limit=1.5
 # ライン未検出時に停止するか
 pid_stop_on_no_line=true
 # 学習ゲインの時間平滑化（0.0:平滑なし, 1.0:非常に強い追従）
-pid_gain_smoothing_alpha=0.20
+pid_gain_smoothing_alpha=0.40
 # 操舵量のフレーム間変化上限（小さいほど暴れにくい）
-pid_steer_rate_limit=0.10
+pid_steer_rate_limit=0.20
 # モータ符号補正（直進でその場回転する場合は見直す）
 motor_left_sign=-1
 motor_right_sign=1
@@ -55,11 +55,12 @@ motor_right_sign=1
 # カメラ選択肢
 camera_id=camera_1
 camera_id=camera_2
-camera_id=camera_3
-default_camera_id=camera_3
+camera_id=camera_4
+default_camera_id=camera_4
 
 # 走行種別は drive_type= で複数行書けます
 drive_type=straight
+drive_type=recovery
 drive_type=left_curve
 drive_type=right_curve
 drive_type=stop_and_go

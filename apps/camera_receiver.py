@@ -134,6 +134,9 @@ class CameraReceiver:
             "line_offset_top": 0.0,
             "line_offset_mid": 0.0,
             "line_offset_bottom": 0.0,
+            "line_width_top": 0.0,
+            "line_width_mid": 0.0,
+            "line_width_bottom": 0.0,
         }
 
     def get_offset_jump_threshold(self) -> float:
@@ -952,10 +955,12 @@ class CameraReceiver:
             px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
             wz = int(max(0.0, interp_widths[ay]))
 
-            # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離）
+            # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離 + 幅）
             offset_norm = float((px - (w / 2.0)) / max(w / 2.0, 1.0))
+            width_norm = float(wz) / max(1.0, float(w))
             features[f"line_detect_{zone_key}"] = 1.0
             features[f"line_offset_{zone_key}"] = float(np.clip(offset_norm, -1.0, 1.0))
+            features[f"line_width_{zone_key}"] = float(np.clip(width_norm, 0.0, 1.0))
 
             py = ay_global  # 表示位置は固定深度
             cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
