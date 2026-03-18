@@ -310,6 +310,31 @@ class UnifiedApp:
         )
         self.debug_overlay_check.pack(side=tk.LEFT, padx=(12, 0))
 
+        self.offset_filter_frame = tk.Frame(self.main_frame)
+        self.offset_filter_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
+        tk.Label(self.offset_filter_frame, text="Offsetジャンプ閾値(各ゾーン):").pack(side=tk.LEFT)
+        self.offset_jump_threshold_var = tk.DoubleVar(value=self.camera_receiver.get_offset_jump_threshold())
+        self.offset_jump_threshold_scale = tk.Scale(
+            self.offset_filter_frame,
+            from_=0.10,
+            to=1.00,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.offset_jump_threshold_var,
+            command=self.on_offset_jump_threshold_change,
+            showvalue=False,
+            length=160,
+        )
+        self.offset_jump_threshold_scale.pack(side=tk.LEFT)
+        self.offset_jump_threshold_label = tk.Label(
+            self.offset_filter_frame,
+            text=f"{self.camera_receiver.get_offset_jump_threshold():.2f}",
+            width=5,
+        )
+        self.offset_jump_threshold_label.pack(side=tk.LEFT)
+        tk.Label(self.offset_filter_frame, text="(1.00=無効)", fg="gray50").pack(side=tk.LEFT, padx=(4, 0))
+
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
@@ -463,6 +488,10 @@ class UnifiedApp:
 
     def on_drive_speed_change(self, _value: str) -> None:
         self.drive_speed_value_label.config(text=f"{self.get_drive_speed()}%")
+
+    def on_offset_jump_threshold_change(self, _value: str) -> None:
+        val = self.camera_receiver.set_offset_jump_threshold(float(self.offset_jump_threshold_var.get()))
+        self.offset_jump_threshold_label.config(text=f"{val:.2f}")
 
     def on_far_threshold_change(self, _value: str) -> None:
         far, _ = self.camera_receiver.set_thresholds(far_threshold=int(self.far_threshold_var.get()))

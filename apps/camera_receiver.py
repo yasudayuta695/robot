@@ -37,6 +37,8 @@ class CameraReceiver:
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._lost_feature_hold_frames = 8
+        self._offset_jump_threshold: float = 0.45
+        self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
         self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
         self._line_detection_config = LineDetectionConfig()
         self._running = False
@@ -113,6 +115,8 @@ class CameraReceiver:
         self._consecutive_misses += 1
         if self._consecutive_misses > 8:
             self._prev_center_x = None
+            for zone in ("top", "mid", "bottom"):
+                self._prev_accepted_offsets[zone] = None
 
     def _on_detection_success(self, center_x: float) -> None:
         if self._prev_center_x is None:
@@ -132,9 +136,32 @@ class CameraReceiver:
             "line_offset_bottom": 0.0,
         }
 
+    def get_offset_jump_threshold(self) -> float:
+        with self._lock:
+            return float(self._offset_jump_threshold)
+
+    def set_offset_jump_threshold(self, value: float) -> float:
+        with self._lock:
+            self._offset_jump_threshold = float(np.clip(value, 0.05, 1.0))
+            return self._offset_jump_threshold
+
     def _set_latest_line_features(self, features: Dict[str, float]) -> None:
         with self._lock:
             incoming = features.copy()
+
+            # Per-zone outlier rejection: offset が前フレームから急変したゾーンを detect=0 に落とす
+            threshold = self._offset_jump_threshold
+            for zone in ("top", "mid", "bottom"):
+                detect_key = f"line_detect_{zone}"
+                offset_key = f"line_offset_{zone}"
+                if float(incoming.get(detect_key, 0.0)) > 0.0:
+                    new_offset = float(incoming.get(offset_key, 0.0))
+                    prev = self._prev_accepted_offsets[zone]
+                    if prev is not None and abs(new_offset - prev) > threshold:
+                        # 外れ値: このゾーンをロスト扱いにする
+                        incoming[detect_key] = 0.0
+                    else:
+                        self._prev_accepted_offsets[zone] = new_offset
 
             incoming_detect_sum = (
                 float(incoming.get("line_detect_top", 0.0))
@@ -547,12 +574,13 @@ class CameraReceiver:
             return {}
 
         # 行ごとの最大許容セグメント幅をベクトル化計算
+        # カーブ時にコース幅が広がることを考慮し、Near側は最大75%まで許容
         all_rows = np.arange(roi_h, dtype=np.float64)
         t = all_rows / max(1.0, float(roi_h - 1))
-        base_ratio = 0.18 + 0.22 * t
+        base_ratio = 0.18 + 0.57 * t
         relax = min(0.10, 0.025 * float(self._consecutive_misses))
-        ratio = np.clip(base_ratio + relax, 0.16, 0.52)
-        max_widths = np.clip((ratio * float(frame_width)).astype(np.int32), 8, 260)
+        ratio = np.clip(base_ratio + relax, 0.16, 0.75)
+        max_widths = np.clip((ratio * float(frame_width)).astype(np.int32), 8, int(frame_width * 0.90))
 
         unique_rows, starts, counts = np.unique(ys, return_index=True, return_counts=True)
         result: Dict[int, list[tuple[float, float, int, int]]] = {}

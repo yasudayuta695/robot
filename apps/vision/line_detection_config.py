@@ -49,7 +49,7 @@ class ContourRuleConfig:
     full_span_bw_ratio_min: float = 0.25
 
     vertical_blob_bw_ratio_min: float = 0.34
-    vertical_blob_fill_ratio_min: float = 0.30
+    vertical_blob_fill_ratio_min: float = 0.45
     vertical_blob_aspect_max: float = 2.0
 
     blob_penalty_width_ratio_min: float = 0.82
