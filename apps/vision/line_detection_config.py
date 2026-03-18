@@ -79,6 +79,9 @@ class PostTrackRejectConfig:
     final_contour_area_min: float = 220.0
     too_wide_med_ratio: float = 0.18
     too_wide_p90_ratio: float = 0.28
+    too_wide_min_near_rows_count: int = 24
+    too_wide_min_bottom_reach_ratio: float = 0.62
+    too_wide_min_span_ratio_rows: float = 0.42
 
     far_thin_width_p90_max: float = 16.0
     thin_no_near_width_med_max: float = 9.0
@@ -121,6 +124,9 @@ def _apply_panel_seam_tuning(cfg: LineDetectionConfig) -> None:
 
 def _apply_glare_tuning(cfg: LineDetectionConfig) -> None:
     cfg.post_track.final_contour_area_min = 180.0
+    cfg.post_track.too_wide_min_near_rows_count = 18
+    cfg.post_track.too_wide_min_bottom_reach_ratio = 0.58
+    cfg.post_track.too_wide_min_span_ratio_rows = 0.36
     cfg.post_track.far_thin_width_p90_max = 13.0
     cfg.post_track.thin_no_near_width_med_max = 7.5
     cfg.post_track.thin_no_near_bottom_reach_max = 0.66

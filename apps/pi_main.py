@@ -441,7 +441,7 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
             {
                 "AeEnable": False,
                 "AwbEnable": False,
-                "ExposureTime": 5500,
+                "ExposureTime": 4000,
                 "AnalogueGain": 1.0,
             }
         )

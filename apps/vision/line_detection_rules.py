@@ -206,8 +206,18 @@ def evaluate_post_track_reject_reason(
     span_ratio_rows: float,
     cfg: PostTrackRejectConfig,
 ) -> Optional[str]:
-    if width_med > (cfg.too_wide_med_ratio * float(frame_width)) and width_p90 > (cfg.too_wide_p90_ratio * float(frame_width)):
-        return "too_wide"
+    is_too_wide = (
+        width_med > (cfg.too_wide_med_ratio * float(frame_width))
+        and width_p90 > (cfg.too_wide_p90_ratio * float(frame_width))
+    )
+    if is_too_wide:
+        has_strong_near_support = has_near_support and (near_rows_count >= cfg.too_wide_min_near_rows_count)
+        has_strong_depth_support = (
+            bottom_reach_ratio >= cfg.too_wide_min_bottom_reach_ratio
+            and span_ratio_rows >= cfg.too_wide_min_span_ratio_rows
+        )
+        if not (has_strong_near_support and has_strong_depth_support):
+            return "too_wide"
     if (not has_near_support) and (width_p90 < cfg.far_thin_width_p90_max):
         return "far_thin"
     if width_med < cfg.thin_no_near_width_med_max and bottom_reach_ratio < cfg.thin_no_near_bottom_reach_max:
