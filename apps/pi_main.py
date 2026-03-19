@@ -14,6 +14,7 @@ from picamera2 import Picamera2
 
 from ai_controller import LineTraceONNXController
 from camera_receiver import CameraReceiver
+from lstm_pid_controller import LSTMPIDONNXController
 from pid_learned_controller import LearnedPIDONNXController
 
 
@@ -718,9 +719,125 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
         picam2.stop()
 
 
+def run_lstm_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> None:
+    logger = logging.getLogger("pi_lstm_pid")
+    logger.setLevel(logging.INFO)
+
+    print(f"[lstm_pid] Loading runtime config: {args.config_path}")
+    runtime_cfg = load_runtime_config(args.config_path)
+    cam_w, cam_h = _resolve_camera_frame_size(runtime_cfg.camera_stream_profile)
+    motor_left_sign = int(runtime_cfg.motor_left_sign)
+    motor_right_sign = int(runtime_cfg.motor_right_sign)
+
+    onnx_path = os.path.abspath(os.path.expanduser(args.onnx_path))
+    if not os.path.isfile(onnx_path):
+        raise FileNotFoundError(f"LSTM ONNX model not found: {onnx_path}")
+
+    line_detector = CameraReceiver("127.0.0.1", 0, logger)
+    line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_line_color_space(runtime_cfg.line_color_space)
+    line_detector.set_line_detection_profile_name(runtime_cfg.line_detection_profile)
+    line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
+    line_detector.set_thresholds(
+        far_threshold=int(runtime_cfg.far_threshold),
+        near_threshold=int(runtime_cfg.near_threshold),
+    )
+
+    controller = LSTMPIDONNXController(
+        history=int(args.history),
+        smoothing_alpha=float(runtime_cfg.ai_smoothing_alpha),
+        max_motor_speed=int(args.max_motor_speed),
+        stop_on_no_line=bool(runtime_cfg.pid_stop_on_no_line),
+        steer_limit=float(runtime_cfg.pid_output_limit),
+        no_line_hold_frames=int(runtime_cfg.ai_no_line_hold_frames),
+        no_line_brake_frames=int(runtime_cfg.ai_no_line_brake_frames),
+        gain_smoothing_alpha=float(runtime_cfg.pid_gain_smoothing_alpha),
+        steer_rate_limit=float(runtime_cfg.pid_steer_rate_limit),
+    )
+    print("[lstm_pid] Loading ONNX model...")
+    controller.load_model(onnx_path)
+    print("[lstm_pid] ONNX model loaded.")
+
+    control_interval_sec = max(0.02, float(runtime_cfg.ai_control_interval_ms) / 1000.0)
+    line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
+    camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
+
+    model_left_speed = 0
+    model_right_speed = 0
+    last_control_ts = 0.0
+    last_line_ts = 0.0
+    last_log_ts = 0.0
+    cached_features = line_detector.get_latest_line_features()
+
+    print("[lstm_pid] Initializing camera...")
+    picam2 = Picamera2()
+    cam_conf = picam2.create_video_configuration(
+        main={"size": (cam_w, cam_h), "format": "RGB888"}
+    )
+    picam2.configure(cam_conf)
+    picam2.start()
+    picam2.set_controls(
+        {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": int(args.exposure_time),
+            "AnalogueGain": float(args.analogue_gain),
+        }
+    )
+
+    print("[lstm_pid] Started.")
+    print(f"[lstm_pid] ONNX={onnx_path}")
+
+    try:
+        while True:
+            now = time.perf_counter()
+
+            frame_rgb = picam2.capture_array()
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            if (now - last_line_ts) >= line_interval_sec:
+                line_detector.find_line(frame_bgr)
+                cached_features = line_detector.get_latest_line_features()
+                last_line_ts = now
+
+            if (now - last_control_ts) >= control_interval_sec:
+                left_speed, right_speed = controller.predict_motor_speed(
+                    line_features=cached_features,
+                    current_left_speed=model_left_speed,
+                    current_right_speed=model_right_speed,
+                    base_speed=int(args.base_speed),
+                )
+
+                model_left_speed = int(np.clip(left_speed, -100, 100))
+                model_right_speed = int(np.clip(right_speed, -100, 100))
+
+                hw_left_speed = int(np.clip(model_left_speed * motor_left_sign, -100, 100))
+                hw_right_speed = int(np.clip(model_right_speed * motor_right_sign, -100, 100))
+
+                set_left_motor(hw_left_speed, pwm_b)
+                set_right_motor(hw_right_speed, pwm_a)
+                last_control_ts = now
+
+                if (now - last_log_ts) >= 1.0:
+                    kp, ki, kd = controller.last_gains
+                    print(
+                        "[lstm_pid] gain=(%.3f, %.3f, %.3f) model_cmd=(%d,%d) hw_cmd=(%d,%d)"
+                        % (kp, ki, kd, model_left_speed, model_right_speed, hw_left_speed, hw_right_speed)
+                    )
+                    last_log_ts = now
+
+            if camera_sleep_sec > 0.0:
+                time.sleep(camera_sleep_sec)
+    except KeyboardInterrupt:
+        print("Stopping lstm_pid mode...")
+    finally:
+        stop_all_motors(pwm_a, pwm_b)
+        picam2.stop()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Raspberry Pi runtime for robot car (remote or local AI mode)")
-    parser.add_argument("--mode", type=str, default="remote", choices=["remote", "local_ai", "pid", "pid_learned"])
+    parser.add_argument("--mode", type=str, default="remote", choices=["remote", "local_ai", "pid", "pid_learned", "lstm_pid"])
     parser.add_argument("--config-path", type=str, default="")
     parser.add_argument("--onnx-path", type=str, default="")
     parser.add_argument("--history", type=int, default=10)
@@ -774,6 +891,8 @@ if __name__ == "__main__":
             run_pid_mode(args, pwm_a, pwm_b)
         elif args.mode == "pid_learned":
             run_pid_learned_mode(args, pwm_a, pwm_b)
+        elif args.mode == "lstm_pid":
+            run_lstm_pid_mode(args, pwm_a, pwm_b)
         else:
             run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps, config_path=args.config_path)
     finally:

@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
 
+from lstm_pid_controller import LSTMPIDONNXController
 from pid_learned_controller import LearnedPIDONNXController
 from camera_receiver import CameraReceiver
 from config_loader import AppConfig, ensure_config_file, load_config, migrate_legacy_config_if_needed
@@ -746,6 +747,21 @@ class UnifiedApp:
         )
         self.send_command(left_speed, right_speed)
 
+    def _make_ai_controller(self, model_path: str):
+        """ファイル名に 'lstm' が含まれていれば LSTM コントローラーを返す。"""
+        use_lstm = "lstm" in os.path.basename(model_path).lower()
+        cls = LSTMPIDONNXController if use_lstm else LearnedPIDONNXController
+        return cls(
+            history=10,
+            smoothing_alpha=self.config.ai_smoothing_alpha,
+            max_motor_speed=100,
+            stop_on_no_line=True,
+            no_line_hold_frames=self.config.ai_no_line_hold_frames,
+            no_line_brake_frames=self.config.ai_no_line_brake_frames,
+            gain_smoothing_alpha=self.config.pid_gain_smoothing_alpha,
+            steer_rate_limit=self.config.pid_steer_rate_limit,
+        )
+
     def load_ai_model(self) -> None:
         model_path = self.ai_model_path_var.get().strip()
         if not model_path:
@@ -758,10 +774,12 @@ class UnifiedApp:
             return
 
         try:
+            self.ai_controller = self._make_ai_controller(model_path)
             self.ai_controller.load_model(model_path)
-            self.ai_status_var.set(f"AI model loaded: {model_path}")
+            controller_type = type(self.ai_controller).__name__
+            self.ai_status_var.set(f"[{controller_type}] AI model loaded: {model_path}")
             self._ai_error_logged = False
-            self.logger.info("AI ONNX model loaded: %s", to_wsl_unc_path(model_path, self.wsl_distro_name))
+            self.logger.info("AI ONNX model loaded (%s): %s", controller_type, to_wsl_unc_path(model_path, self.wsl_distro_name))
         except Exception as exc:
             self.ai_status_var.set(f"AI load failed: {exc}")
             self.logger.warning("AI model load failed: %s", exc)
