@@ -450,7 +450,7 @@ class CameraReceiver:
         contours: list[np.ndarray],
         roi_h: int,
         frame_width: int,
-    ) -> tuple[float, Optional[int], Optional[np.ndarray], list[Dict[str, float | int | str]]]:
+    ) -> tuple[float, Optional[int], Optional[np.ndarray], list[Dict[str, float | int | str]], bool]:
         cfg = self.get_line_detection_config()
 
         def max_segment_width_px(row_index: int) -> int:
@@ -537,7 +537,7 @@ class CameraReceiver:
 
         best_score, best_idx, target = max(scored_contours, key=lambda item: item[0])
         if best_score > 0.0:
-            return best_score, best_idx, target, contour_entries
+            return best_score, best_idx, target, contour_entries, False
 
         soft_best_score = -1.0
         soft_best_idx = None
@@ -581,14 +581,14 @@ class CameraReceiver:
                 soft_best_cnt = cnt
 
         if soft_best_idx is None or soft_best_cnt is None:
-            return best_score, best_idx, target, contour_entries
+            return best_score, best_idx, target, contour_entries, False
 
         for entry in contour_entries:
             if int(entry["idx"]) == int(soft_best_idx):
                 entry["reason"] = "soft_recover"
                 entry["score"] = float(soft_best_score)
                 break
-        return soft_best_score, int(soft_best_idx), soft_best_cnt, contour_entries
+        return soft_best_score, int(soft_best_idx), soft_best_cnt, contour_entries, True
 
     def _precompute_row_segments(
         self,
@@ -682,7 +682,7 @@ class CameraReceiver:
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
-        best_score, best_idx, target, contour_entries = self._find_best_contour(
+        best_score, best_idx, target, contour_entries, using_soft_recover = self._find_best_contour(
             contours=contours,
             roi_h=roi_h,
             frame_width=w,
@@ -714,7 +714,9 @@ class CameraReceiver:
         # 全行のセグメント情報を一括計算（行ごとのNumPy呼び出しを排除）
         all_row_segs = self._precompute_row_segments(target_mask, w)
 
-        seed_center_row = int(np.clip(roi_h * 0.52, 0, roi_h - 1))
+        # soft_recover のときは遠方ノイズを避けるため近距離側をシードにする
+        seed_center_ratio = 0.68 if using_soft_recover else 0.52
+        seed_center_row = int(np.clip(roi_h * seed_center_ratio, 0, roi_h - 1))
         seed_r0 = max(0, seed_center_row - 30)
         seed_r1 = min(roi_h, seed_center_row + 31)
 
@@ -750,7 +752,7 @@ class CameraReceiver:
             track_w = max(8.0, float(start_w))
             prev_dx = 0.0
             misses = 0
-            max_misses = 24
+            max_misses = 14 if using_soft_recover else 24
 
             end = roi_h if step > 0 else -1
             for r in range(start_row, end, step):
@@ -782,7 +784,10 @@ class CameraReceiver:
 
                 cx, seg_w = best
                 delta_x = float(cx - track_x)
-                jump_limit = (0.24 * float(w)) + (0.95 * float(seg_w)) + (1.40 * abs(prev_dx))
+                if using_soft_recover:
+                    jump_limit = (0.16 * float(w)) + (0.70 * float(seg_w)) + (0.90 * abs(prev_dx))
+                else:
+                    jump_limit = (0.24 * float(w)) + (0.95 * float(seg_w)) + (1.40 * abs(prev_dx))
                 if abs(delta_x) > jump_limit:
                     misses += 1
                     if misses > max_misses:
