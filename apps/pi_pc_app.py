@@ -772,9 +772,13 @@ class UnifiedApp:
             self.logger.info("Debug Overlay: OFF")
 
     def _calib_resend_loop(self) -> None:
-        """キャリブ値が設定されている間、3秒ごとに Pi へ再送する。"""
-        while not self._calib_resend_stop.wait(timeout=3.0):
+        """キャリブ値を 1 秒間隔で最大 3 回再送して接続タイミングのずれを吸収する。"""
+        for _ in range(3):
+            if self._calib_resend_stop.wait(timeout=1.0):
+                break
             w_norm = self.camera_receiver.get_calibrated_width_norm()
+            if w_norm is None:
+                break
             try:
                 self._calib_sock.send_json(
                     {"calib_width_norm": w_norm},

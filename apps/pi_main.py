@@ -537,7 +537,12 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
         ctx = zmq.Context()
         sock = ctx.socket(zmq.PULL)
         sock.setsockopt(zmq.RCVTIMEO, 500)
-        sock.bind(f"tcp://*:{CALIB_PORT}")
+        try:
+            sock.bind(f"tcp://*:{CALIB_PORT}")
+        except zmq.ZMQError as e:
+            print(f"[remote] Calibration socket bind failed (port={CALIB_PORT}): {e}")
+            ctx.term()
+            return
         print("[remote] Calibration receive thread started.")
         try:
             while running:
@@ -552,6 +557,8 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
                         print(f"[remote] Calibration set: {w_norm:.4f}")
                 except zmq.ZMQError:
                     pass
+        except Exception as e:
+            print(f"[remote] Calibration thread error: {e}")
         finally:
             sock.close()
             ctx.term()
