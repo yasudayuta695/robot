@@ -38,6 +38,8 @@ class CameraReceiver:
         self._consecutive_misses = 0
         self._lost_feature_hold_frames = 8
         self._offset_jump_threshold: float = 0.45
+        self._feature_smoothing_alpha: float = 0.30
+        self._offset_deadband: float = 0.015
         self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
         self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
@@ -151,20 +153,40 @@ class CameraReceiver:
     def _set_latest_line_features(self, features: Dict[str, float]) -> None:
         with self._lock:
             incoming = features.copy()
+            prev_features = self._latest_line_features.copy()
 
             # Per-zone outlier rejection: offset が前フレームから急変したゾーンを detect=0 に落とす
             threshold = self._offset_jump_threshold
             for zone in ("top", "mid", "bottom"):
                 detect_key = f"line_detect_{zone}"
                 offset_key = f"line_offset_{zone}"
+                width_key = f"line_width_{zone}"
                 if float(incoming.get(detect_key, 0.0)) > 0.0:
                     new_offset = float(incoming.get(offset_key, 0.0))
+                    new_width = float(incoming.get(width_key, 0.0))
                     prev = self._prev_accepted_offsets[zone]
                     if prev is not None and abs(new_offset - prev) > threshold:
                         # 外れ値: このゾーンをロスト扱いにする
                         incoming[detect_key] = 0.0
                     else:
-                        self._prev_accepted_offsets[zone] = new_offset
+                        prev_detect = float(prev_features.get(detect_key, 0.0))
+                        prev_offset = float(prev_features.get(offset_key, 0.0))
+                        prev_width = float(prev_features.get(width_key, 0.0))
+
+                        if prev_detect > 0.0:
+                            alpha = float(np.clip(self._feature_smoothing_alpha, 0.05, 0.95))
+                            smoothed_offset = (1.0 - alpha) * prev_offset + alpha * new_offset
+                            smoothed_width = (1.0 - alpha) * prev_width + alpha * new_width
+                        else:
+                            smoothed_offset = new_offset
+                            smoothed_width = new_width
+
+                        if abs(smoothed_offset) < float(self._offset_deadband):
+                            smoothed_offset = 0.0
+
+                        incoming[offset_key] = float(np.clip(smoothed_offset, -1.0, 1.0))
+                        incoming[width_key] = float(np.clip(smoothed_width, 0.0, 1.0))
+                        self._prev_accepted_offsets[zone] = float(incoming[offset_key])
 
             incoming_detect_sum = (
                 float(incoming.get("line_detect_top", 0.0))
@@ -954,9 +976,15 @@ class CameraReceiver:
             if ay < valid_row_min or ay > valid_row_max:
                 continue
 
-            # 3点は描画中の中心線そのものから取得する
-            px = int(np.clip(np.round(smooth_centers[ay]), 0, w - 1))
-            wz = int(max(0.0, interp_widths[ay]))
+            # 単一行だと行ノイズで揺れやすいので近傍行の中央値を採用
+            win_half = 3
+            wy0 = int(max(valid_row_min, ay - win_half))
+            wy1 = int(min(valid_row_max, ay + win_half))
+            row_win = np.arange(wy0, wy1 + 1, dtype=np.int32)
+            px_f = float(np.median(smooth_centers[row_win])) if row_win.size > 0 else float(smooth_centers[ay])
+            wz_f = float(np.median(interp_widths[row_win])) if row_win.size > 0 else float(interp_widths[ay])
+            px = int(np.clip(np.round(px_f), 0, w - 1))
+            wz = int(max(0.0, wz_f))
 
             # guide_learn用の保存特徴量（0/1フラグ + 中心からの正規化距離 + 幅）
             offset_norm = float((px - (w / 2.0)) / max(w / 2.0, 1.0))
