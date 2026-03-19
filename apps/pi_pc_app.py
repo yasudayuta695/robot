@@ -64,13 +64,17 @@ class _LineDetectionWorker:
         self._thread: Optional[threading.Thread] = None
 
     @staticmethod
-    def _draw_remote_feature_overlay(frame: np.ndarray, features: Dict[str, float]) -> np.ndarray:
+    def _draw_remote_feature_overlay(frame: np.ndarray, features: Dict[str, float], calib_done: bool = True) -> np.ndarray:
         vis = frame.copy()
         h, w = vis.shape[:2]
         roi_top = int(h * 0.25)
         roi_available = h - roi_top
         y1 = roi_top + (roi_available // 3)
         y2 = roi_top + ((2 * roi_available) // 3)
+        if not calib_done:
+            cx_guide = w // 2
+            cv2.line(vis, (cx_guide, roi_top), (cx_guide, h - 1), (0, 200, 255), 1)
+            cv2.putText(vis, "CALIB?", (cx_guide + 4, roi_top + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1, cv2.LINE_AA)
         zone_rows = {
             "top": (roi_top + y1) // 2,
             "mid": (y1 + y2) // 2,
@@ -148,7 +152,8 @@ class _LineDetectionWorker:
                 remote_age = self._camera_receiver.get_remote_feature_age_sec()
                 has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
                 if has_recent_remote:
-                    vis = self._draw_remote_feature_overlay(frame, features)
+                    calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+                    vis = self._draw_remote_feature_overlay(frame, features, calib_done=calib_done)
                     self._remote_stale_logged = False
                 else:
                     vis = self._camera_receiver.find_line(frame)
@@ -450,6 +455,30 @@ class UnifiedApp:
         self.offset_jump_threshold_label.pack(side=tk.LEFT)
         tk.Label(self.offset_filter_frame, text="(1.00=無効)", fg="gray50").pack(side=tk.LEFT, padx=(4, 0))
 
+        self.calib_width_frame = tk.Frame(self.main_frame)
+        self.calib_width_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
+        tk.Label(self.calib_width_frame, text="幅キャリブ:").pack(side=tk.LEFT)
+        self.calib_width_btn = tk.Button(
+            self.calib_width_frame,
+            text="直線幅をキャリブ",
+            command=self.on_calibrate_width,
+        )
+        self.calib_width_btn.pack(side=tk.LEFT, padx=(4, 8))
+        self.calib_width_label = tk.Label(
+            self.calib_width_frame,
+            text="未設定",
+            width=14,
+            fg="gray50",
+        )
+        self.calib_width_label.pack(side=tk.LEFT)
+        self.calib_width_clear_btn = tk.Button(
+            self.calib_width_frame,
+            text="クリア",
+            command=self.on_clear_calibrated_width,
+        )
+        self.calib_width_clear_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
@@ -708,6 +737,20 @@ class UnifiedApp:
             self.logger.info("Debug Overlay: ON")
         else:
             self.logger.info("Debug Overlay: OFF")
+
+    def on_calibrate_width(self) -> None:
+        w_norm = self.camera_receiver.calibrate_straight_width()
+        if w_norm is None:
+            self.calib_width_label.config(text="検出なし", fg="red")
+            self.logger.warning("幅キャリブレーション失敗: 直線検出データなし")
+        else:
+            self.calib_width_label.config(text=f"{w_norm:.3f} (norm)", fg="green")
+            self.logger.info("幅キャリブレーション設定: %.3f (norm)", w_norm)
+
+    def on_clear_calibrated_width(self) -> None:
+        self.camera_receiver.clear_calibrated_width()
+        self.calib_width_label.config(text="未設定", fg="gray50")
+        self.logger.info("幅キャリブレーションをクリア")
 
     def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
         self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
