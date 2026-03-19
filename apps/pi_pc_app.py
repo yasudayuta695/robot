@@ -3,6 +3,7 @@ import os
 import threading
 import tkinter as tk
 import time
+import datetime
 import cv2
 import numpy as np
 from tkinter import messagebox, ttk
@@ -42,6 +43,8 @@ DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
 DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
+COORD_STREAM_INTERVAL_SEC = 0.05
+COORD_STREAM_MAX_LINES = 220
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -251,6 +254,9 @@ class UnifiedApp:
         self._last_ai_control_time = 0.0
         self._cached_line_vis = None
         self._cached_line_features = self.camera_receiver.get_latest_line_features()
+        self._coord_stream_interval_sec = COORD_STREAM_INTERVAL_SEC
+        self._coord_stream_last_ts = 0.0
+        self._coord_stream_line_count = 0
 
         self._line_worker = _LineDetectionWorker(
             camera_receiver=self.camera_receiver,
@@ -508,6 +514,21 @@ class UnifiedApp:
         self.camera_label = tk.Label(self.bottom_frame, bg="black", width=640, height=480)
         self.camera_label.pack(side=tk.LEFT, padx=10)
 
+        self.coord_panel = tk.LabelFrame(self.bottom_frame, text="座標ストリーム")
+        self.coord_panel.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+
+        self.coord_text = tk.Text(
+            self.coord_panel,
+            width=56,
+            height=29,
+            font=("Courier", 9),
+            wrap="none",
+        )
+        self.coord_text_scroll = tk.Scrollbar(self.coord_panel, orient=tk.VERTICAL, command=self.coord_text.yview)
+        self.coord_text.configure(yscrollcommand=self.coord_text_scroll.set)
+        self.coord_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+        self.coord_text_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=8)
+
         self.joy_frame = tk.Frame(self.bottom_frame)
         self.joy_frame.pack(side=tk.LEFT, padx=10)
 
@@ -594,6 +615,68 @@ class UnifiedApp:
         self.logger.info("実行ファイル: %s", to_wsl_unc_path(self.module_path, self.wsl_distro_name))
         self.logger.info("設定ファイル: %s", to_wsl_unc_path(self.config_path, self.wsl_distro_name))
         self.logger.info("データ保存ルート: %s", to_wsl_unc_path(self.config.save_base_dir, self.wsl_distro_name))
+
+    def _zone_rows_for_frame(self, frame_h: int) -> Dict[str, int]:
+        roi_top = int(frame_h * 0.25)
+        roi_available = frame_h - roi_top
+        y1 = roi_top + (roi_available // 3)
+        y2 = roi_top + ((2 * roi_available) // 3)
+        return {
+            "top": (roi_top + y1) // 2,
+            "mid": (y1 + y2) // 2,
+            "bottom": (y2 + frame_h) // 2,
+        }
+
+    def _extract_zone_coordinate(
+        self,
+        zone_key: str,
+        line_features: Dict[str, float],
+        frame_w: int,
+        zone_rows: Dict[str, int],
+    ) -> Tuple[int, int, float, int, float]:
+        detect = float(line_features.get(f"line_detect_{zone_key}", 0.0))
+        y = int(zone_rows[zone_key])
+        if detect <= 0.0:
+            return -1, y, 0.0, 0, 0.0
+
+        offset = float(np.clip(line_features.get(f"line_offset_{zone_key}", 0.0), -1.0, 1.0))
+        width_norm = float(np.clip(line_features.get(f"line_width_{zone_key}", 0.0), 0.0, 1.0))
+        x = int(np.clip((frame_w * 0.5) + (offset * (frame_w * 0.5)), 0, frame_w - 1))
+        width_px = int(max(0, round(width_norm * frame_w)))
+        return x, y, offset, width_px, detect
+
+    def _append_coordinate_stream(
+        self,
+        line_features: Dict[str, float],
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
+        if not hasattr(self, "coord_text"):
+            return
+
+        now = time.perf_counter()
+        if (now - self._coord_stream_last_ts) < self._coord_stream_interval_sec:
+            return
+        self._coord_stream_last_ts = now
+
+        zone_rows = self._zone_rows_for_frame(frame_h)
+        top = self._extract_zone_coordinate("top", line_features, frame_w, zone_rows)
+        mid = self._extract_zone_coordinate("mid", line_features, frame_w, zone_rows)
+        bottom = self._extract_zone_coordinate("bottom", line_features, frame_w, zone_rows)
+
+        tstr = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = (
+            f"{tstr} | "
+            f"top(x={top[0]:4d},y={top[1]:3d},off={top[2]:+5.2f},w={top[3]:3d},d={top[4]:.1f}) "
+            f"mid(x={mid[0]:4d},y={mid[1]:3d},off={mid[2]:+5.2f},w={mid[3]:3d},d={mid[4]:.1f}) "
+            f"btm(x={bottom[0]:4d},y={bottom[1]:3d},off={bottom[2]:+5.2f},w={bottom[3]:3d},d={bottom[4]:.1f})"
+        )
+        self.coord_text.insert("end", line + "\n")
+        self._coord_stream_line_count += 1
+        if self._coord_stream_line_count > COORD_STREAM_MAX_LINES:
+            self.coord_text.delete("1.0", "2.0")
+            self._coord_stream_line_count -= 1
+        self.coord_text.see("end")
 
     def on_drive_speed_change(self, _value: str) -> None:
         self.drive_speed_value_label.config(text=f"{self.get_drive_speed()}%")
@@ -946,6 +1029,12 @@ class UnifiedApp:
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
         self.camera_label.image = tk_image
+
+        self._append_coordinate_stream(
+            line_features=line_features,
+            frame_w=display_frame.shape[1],
+            frame_h=display_frame.shape[0],
+        )
 
         self.recorder.record_frame(
             image_rgb=frame,
