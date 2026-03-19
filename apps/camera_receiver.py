@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 import threading
 import time
 from collections import deque
@@ -8,25 +10,89 @@ import numpy as np
 import cv2
 import zmq
 
-from vision.line_detection_config import LineDetectionConfig
-from vision.line_detection_config import (
-    DEFAULT_LINE_DETECTION_PROFILE,
-    build_line_detection_profile,
-)
-from vision.line_detection_rules import (
-    calc_blob_penalty,
-    calc_edge_penalty,
-    evaluate_contour_reject_reason,
-    evaluate_post_track_reject_reason,
-    is_soft_recover_candidate,
-)
+try:
+    from vision.line_detection_config import LineDetectionConfig
+    from vision.line_detection_config import (
+        DEFAULT_LINE_DETECTION_PROFILE,
+        build_line_detection_profile,
+    )
+    from vision.line_detection_rules import (
+        calc_blob_penalty,
+        calc_edge_penalty,
+        evaluate_contour_reject_reason,
+        evaluate_post_track_reject_reason,
+        is_soft_recover_candidate,
+    )
+except ModuleNotFoundError:
+    # Support mixed launch layouts where modules may live under ./vision,
+    # ./apps/vision, or as flat files next to this module.
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    for candidate in (
+        os.path.join(current_dir, "apps"),
+        os.path.join(current_dir, "vision"),
+        current_dir,
+        os.path.join(parent_dir, "apps"),
+        os.path.join(parent_dir, "vision"),
+        parent_dir,
+    ):
+        if os.path.isdir(candidate) and candidate not in sys.path:
+            sys.path.insert(0, candidate)
+
+    try:
+        from vision.line_detection_config import LineDetectionConfig
+        from vision.line_detection_config import (
+            DEFAULT_LINE_DETECTION_PROFILE,
+            build_line_detection_profile,
+        )
+        from vision.line_detection_rules import (
+            calc_blob_penalty,
+            calc_edge_penalty,
+            evaluate_contour_reject_reason,
+            evaluate_post_track_reject_reason,
+            is_soft_recover_candidate,
+        )
+    except ModuleNotFoundError:
+        try:
+            from apps.vision.line_detection_config import LineDetectionConfig
+            from apps.vision.line_detection_config import (
+                DEFAULT_LINE_DETECTION_PROFILE,
+                build_line_detection_profile,
+            )
+            from apps.vision.line_detection_rules import (
+                calc_blob_penalty,
+                calc_edge_penalty,
+                evaluate_contour_reject_reason,
+                evaluate_post_track_reject_reason,
+                is_soft_recover_candidate,
+            )
+        except ModuleNotFoundError:
+            from line_detection_config import LineDetectionConfig
+            from line_detection_config import (
+                DEFAULT_LINE_DETECTION_PROFILE,
+                build_line_detection_profile,
+            )
+            from line_detection_rules import (
+                calc_blob_penalty,
+                calc_edge_penalty,
+                evaluate_contour_reject_reason,
+                evaluate_post_track_reject_reason,
+                is_soft_recover_candidate,
+            )
 
 
 class CameraReceiver:
-    def __init__(self, pi_ip: str, camera_port: int, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        pi_ip: str,
+        camera_port: int,
+        logger: logging.Logger,
+        line_feature_port: Optional[int] = None,
+    ) -> None:
         self.logger = logger
         self.pi_ip = pi_ip
         self.camera_port = camera_port
+        self.line_feature_port = int(line_feature_port) if line_feature_port is not None else None
         self._lock = threading.Lock()
         self._image = np.zeros((480, 640, 3), dtype=np.uint8)
         self._latest_line_features = self._default_line_features()
@@ -34,6 +100,9 @@ class CameraReceiver:
         self._near_threshold = 70
         self._line_color_space = "lab"
         self._auto_threshold_enabled = False
+        self._auto_threshold_update_interval_sec = 1.0
+        self._last_auto_threshold_update_ts = 0.0
+        self._last_remote_feature_ts = 0.0
         self._debug_overlay_enabled = True
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
@@ -49,6 +118,27 @@ class CameraReceiver:
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def is_remote_line_feature_mode(self) -> bool:
+        return self.line_feature_port is not None and int(self.line_feature_port) > 0
+
+    def get_remote_feature_age_sec(self) -> Optional[float]:
+        if not self.is_remote_line_feature_mode():
+            return None
+        with self._lock:
+            ts = float(self._last_remote_feature_ts)
+        if ts <= 0.0:
+            return None
+        return max(0.0, float(time.perf_counter() - ts))
+
+    def _normalize_line_features(self, incoming: Dict[str, float]) -> Dict[str, float]:
+        normalized = self._default_line_features()
+        for key in normalized.keys():
+            try:
+                normalized[key] = float(incoming.get(key, normalized[key]))
+            except (TypeError, ValueError):
+                continue
+        return normalized
 
     def _draw_debug_overlay(
         self,
@@ -255,6 +345,9 @@ class CameraReceiver:
     def set_auto_threshold_enabled(self, enabled: bool) -> bool:
         with self._lock:
             self._auto_threshold_enabled = bool(enabled)
+            if self._auto_threshold_enabled:
+                # Enable時に初回更新を即実行できるようにする
+                self._last_auto_threshold_update_ts = 0.0
             return self._auto_threshold_enabled
 
     def is_debug_overlay_enabled(self) -> bool:
@@ -331,8 +424,15 @@ class CameraReceiver:
             far_threshold = int(self._far_threshold)
             near_threshold = int(self._near_threshold)
             auto_enabled = bool(self._auto_threshold_enabled)
+            last_update_ts = float(self._last_auto_threshold_update_ts)
+            auto_update_interval_sec = float(self._auto_threshold_update_interval_sec)
 
         if not auto_enabled:
+            return far_threshold, near_threshold
+
+        now_ts = time.perf_counter()
+        if (now_ts - last_update_ts) < auto_update_interval_sec:
+            # しきい値統計計算（percentile/otsu）を毎フレーム実行しない
             return far_threshold, near_threshold
 
         far_region = blur[:far_split, :]
@@ -365,6 +465,7 @@ class CameraReceiver:
         with self._lock:
             self._far_threshold = int(np.clip(far_threshold, 0, 255))
             self._near_threshold = int(np.clip(near_threshold, 0, 255))
+            self._last_auto_threshold_update_ts = now_ts
             return self._far_threshold, self._near_threshold
 
     def start(self) -> None:
@@ -392,10 +493,17 @@ class CameraReceiver:
     ) -> tuple[np.ndarray, int, int, int, str]:
         roi_full = vis[roi_top:, :]
         roi_h_full = roi_full.shape[0]
+        color_mode = self.get_line_color_space()
 
-        # 半分の解像度でマスク処理を行い高速化（処理面積 1/4）
-        proc_w = frame_width // 2
-        proc_h = roi_h_full // 2
+        # 低解像度入力(320x240など)では情報欠落を防ぐため、縮小率を弱める。
+        if frame_width >= 640:
+            proc_scale = 0.5
+        elif frame_width >= 480:
+            proc_scale = 0.6
+        else:
+            proc_scale = 0.75
+        proc_w = max(96, int(round(frame_width * proc_scale)))
+        proc_h = max(72, int(round(roi_h_full * proc_scale)))
         roi = cv2.resize(roi_full, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
 
         blur, intensity_mode = self._prepare_intensity_channel(roi)
@@ -406,10 +514,58 @@ class CameraReceiver:
         _, mask_far = cv2.threshold(blur[:far_split, :], far_threshold, 255, cv2.THRESH_BINARY_INV)
         _, mask_near = cv2.threshold(blur[far_split:, :], near_threshold, 255, cv2.THRESH_BINARY_INV)
 
+        if color_mode == "hsv":
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            s_chan = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+            sat_threshold = int(np.clip(np.percentile(s_chan, 60), 55, 130))
+            _, sat_low_mask = cv2.threshold(s_chan, sat_threshold, 255, cv2.THRESH_BINARY_INV)
+
+            gated_far = cv2.bitwise_and(mask_far, sat_low_mask[:far_split, :])
+            gated_near = cv2.bitwise_and(mask_near, sat_low_mask[far_split:, :])
+
+            # 低彩度ゲートが強すぎて候補が消える場合は元マスクへ戻す。
+            if cv2.countNonZero(gated_far) > int(mask_far.size * 0.012):
+                mask_far = gated_far
+            if cv2.countNonZero(gated_near) > int(mask_near.size * 0.012):
+                mask_near = gated_near
+
         global_mask = np.zeros_like(blur, dtype=np.uint8)
         global_mask[:far_split, :] = mask_far
         global_mask[far_split:, :] = mask_near
         mask = global_mask.copy()
+
+        # 固定閾値運用時に環境が変わるとマスクが全欠損/全飽和しやすい。
+        # 占有率に応じて当該フレームのみ閾値を自己回復させる。
+        mask_nonzero = int(cv2.countNonZero(mask))
+        mask_size = int(mask.size)
+        occ_ratio = float(mask_nonzero) / max(1.0, float(mask_size))
+
+        if occ_ratio < 0.003:
+            relaxed_far = int(np.clip(far_threshold + 16, 0, 255))
+            relaxed_near = int(np.clip(near_threshold + 16, 0, 255))
+            _, relaxed_far_mask = cv2.threshold(blur[:far_split, :], relaxed_far, 255, cv2.THRESH_BINARY_INV)
+            _, relaxed_near_mask = cv2.threshold(blur[far_split:, :], relaxed_near, 255, cv2.THRESH_BINARY_INV)
+            relaxed_mask = np.zeros_like(mask)
+            relaxed_mask[:far_split, :] = relaxed_far_mask
+            relaxed_mask[far_split:, :] = relaxed_near_mask
+            if cv2.countNonZero(relaxed_mask) > mask_nonzero:
+                mask = relaxed_mask
+                global_mask = relaxed_mask.copy()
+                far_threshold = relaxed_far
+                near_threshold = relaxed_near
+        elif occ_ratio > 0.52:
+            tight_far = int(np.clip(far_threshold - 12, 0, 255))
+            tight_near = int(np.clip(near_threshold - 12, 0, 255))
+            _, tight_far_mask = cv2.threshold(blur[:far_split, :], tight_far, 255, cv2.THRESH_BINARY_INV)
+            _, tight_near_mask = cv2.threshold(blur[far_split:, :], tight_near, 255, cv2.THRESH_BINARY_INV)
+            tight_mask = np.zeros_like(mask)
+            tight_mask[:far_split, :] = tight_far_mask
+            tight_mask[far_split:, :] = tight_near_mask
+            if cv2.countNonZero(tight_mask) < mask_nonzero:
+                mask = tight_mask
+                global_mask = tight_mask.copy()
+                far_threshold = tight_far
+                near_threshold = tight_near
 
         if self._prev_center_x is not None and self._consecutive_misses < 3:
             center_hint = float(np.clip(self._prev_center_x * 0.5, 0.0, float(proc_w - 1)))
@@ -447,17 +603,22 @@ class CameraReceiver:
 
             mask = mask & (corridor_mask.view(np.uint8) * 255)
 
+            # corridor が厳しすぎて消失する場合は、当該フレームのみ corridor を外す。
+            if cv2.countNonZero(mask) < int(max(24, mask.size * 0.0015)):
+                mask = global_mask.copy()
+
         kernel_far = np.ones((2, 2), np.uint8)
-        kernel_near = np.ones((3, 3), np.uint8)
+        kernel_near_open = np.ones((3, 3), np.uint8)
+        kernel_near_close = np.ones((4, 4), np.uint8)
         far_region = cv2.morphologyEx(mask[:far_split, :], cv2.MORPH_OPEN, kernel_far)
         far_region = cv2.morphologyEx(far_region, cv2.MORPH_CLOSE, kernel_far)
-        near_region = cv2.morphologyEx(mask[far_split:, :], cv2.MORPH_OPEN, kernel_near)
-        near_region = cv2.morphologyEx(near_region, cv2.MORPH_CLOSE, kernel_near)
+        near_region = cv2.morphologyEx(mask[far_split:, :], cv2.MORPH_OPEN, kernel_near_open)
+        near_region = cv2.morphologyEx(near_region, cv2.MORPH_CLOSE, kernel_near_close)
         mask[:far_split, :] = far_region
         mask[far_split:, :] = near_region
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((4, 2), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 4), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 5), np.uint8))
 
         # 元解像度に戻す（輪郭検出・追跡・スコアリングは元解像度で動作）
         mask = cv2.resize(mask, (frame_width, roi_h_full), interpolation=cv2.INTER_NEAREST)
@@ -673,11 +834,136 @@ class CameraReceiver:
                 result[r] = segs
         return result
 
+    def _apply_simple_line_fallback(
+        self,
+        vis: np.ndarray,
+        roi_top: int,
+        y1: int,
+        y2: int,
+        frame_h: int,
+        frame_w: int,
+        debug_overlay_enabled: bool,
+    ) -> bool:
+        roi = vis[roi_top:, :]
+        if roi.size == 0:
+            return False
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        roi_h = gray.shape[0]
+
+        features = self._default_line_features()
+        detected_centers: Dict[str, float] = {}
+
+        zones = [
+            ("Far", "top", (roi_top + y1) // 2),
+            ("Mid", "mid", (y1 + y2) // 2),
+            ("Near", "bottom", (y2 + frame_h) // 2),
+        ]
+
+        center_ref_default = float(self._prev_center_x) if self._prev_center_x is not None else (frame_w * 0.5)
+        min_seg_w = max(4, int(frame_w * 0.015))
+        max_seg_w = max(min_seg_w + 2, int(frame_w * 0.55))
+
+        for name, zone_key, ay_global in zones:
+            ay = int(np.clip(ay_global - roi_top, 0, roi_h - 1))
+            by0 = max(0, ay - 6)
+            by1 = min(roi_h, ay + 7)
+            band = gray[by0:by1, :]
+            if band.size == 0:
+                continue
+
+            profile = np.median(band, axis=0).astype(np.float32)
+            profile = cv2.GaussianBlur(profile.reshape(1, -1), (9, 1), 0).reshape(-1)
+
+            p20 = float(np.percentile(profile, 20))
+            p50 = float(np.percentile(profile, 50))
+            dark_thr = min(p20 + 8.0, p50 - 4.0)
+            dark_mask = profile <= dark_thr
+
+            xs = np.flatnonzero(dark_mask)
+            if xs.size < 2:
+                continue
+
+            split_idx = np.where(np.diff(xs) > 1)[0] + 1
+            groups = np.split(xs, split_idx)
+
+            best_cx = None
+            best_w = None
+            best_cost = float("inf")
+            for group in groups:
+                if group.size < 2:
+                    continue
+                x0 = int(group[0])
+                x1_ = int(group[-1])
+                seg_w = x1_ - x0
+                if seg_w < min_seg_w or seg_w > max_seg_w:
+                    continue
+                cx = 0.5 * float(x0 + x1_)
+                center_ref = float(detected_centers.get("bottom", detected_centers.get("mid", center_ref_default)))
+                cost = abs(cx - center_ref) - (0.10 * float(seg_w))
+                if cost < best_cost:
+                    best_cost = cost
+                    best_cx = cx
+                    best_w = float(seg_w)
+
+            if best_cx is None or best_w is None:
+                continue
+
+            px = int(np.clip(round(best_cx), 0, frame_w - 1))
+            width_norm = float(np.clip(best_w / max(1.0, float(frame_w)), 0.0, 1.0))
+            offset_norm = float(np.clip((float(px) - (frame_w * 0.5)) / max(frame_w * 0.5, 1.0), -1.0, 1.0))
+
+            features[f"line_detect_{zone_key}"] = 1.0
+            features[f"line_offset_{zone_key}"] = offset_norm
+            features[f"line_width_{zone_key}"] = width_norm
+            detected_centers[zone_key] = float(px)
+
+            if debug_overlay_enabled:
+                py = ay_global
+                cv2.circle(vis, (px, py), 5, (0, 200, 255), -1)
+                cv2.putText(
+                    vis,
+                    f"{name}:fb x={px} y={py}",
+                    (px + 6, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.43,
+                    (0, 200, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        if (
+            features["line_detect_top"] <= 0.0
+            and features["line_detect_mid"] <= 0.0
+            and features["line_detect_bottom"] <= 0.0
+        ):
+            return False
+
+        track_cx = detected_centers.get("bottom", detected_centers.get("mid", detected_centers.get("top")))
+        if track_cx is not None:
+            self._on_detection_success(float(track_cx))
+
+        if debug_overlay_enabled:
+            cv2.putText(
+                vis,
+                "fallback active",
+                (10, 122),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 200, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        self._set_latest_line_features(features)
+        return True
+
     def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
-        vis = img.copy()
+        debug_overlay_enabled = self.is_debug_overlay_enabled()
+        vis = img.copy() if debug_overlay_enabled else img
         h, w = vis.shape[:2]
         features = self._default_line_features()
-        debug_overlay_enabled = self.is_debug_overlay_enabled()
 
         # 上部25%をカットして処理負荷を削減
         roi_top = int(h * 0.25)
@@ -691,26 +977,29 @@ class CameraReceiver:
         _roi_available = h - roi_top
         y1 = roi_top + _roi_available // 3
         y2 = roi_top + 2 * _roi_available // 3
-        cv2.line(vis, (0, y1), (w - 1, y1), (120, 120, 120), 1)
-        cv2.line(vis, (0, y2), (w - 1, y2), (120, 120, 120), 1)
-        cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-        cv2.putText(vis, "Mid", (8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-        cv2.putText(vis, "Near", (8, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-        cv2.putText(
-            vis,
-            f"{intensity_mode} th_far={far_threshold} th_near={near_threshold}",
-            (10, h - 12),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (180, 180, 180),
-            1,
-            cv2.LINE_AA,
-        )
+        if debug_overlay_enabled:
+            cv2.line(vis, (0, y1), (w - 1, y1), (120, 120, 120), 1)
+            cv2.line(vis, (0, y2), (w - 1, y2), (120, 120, 120), 1)
+            cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(vis, "Mid", (8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(vis, "Near", (8, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(
+                vis,
+                f"{intensity_mode} th_far={far_threshold} th_near={near_threshold}",
+                (10, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (180, 180, 180),
+                1,
+                cv2.LINE_AA,
+            )
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             if debug_overlay_enabled:
                 self._draw_debug_overlay(vis, roi_top, [], best_idx=None)
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -725,13 +1014,16 @@ class CameraReceiver:
 
         min_final_area = self.get_line_detection_config().post_track.final_contour_area_min
         if best_score <= 0.0 or cv2.contourArea(target) <= min_final_area:
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
 
         # 描画用にグローバル座標へ戻す
-        target_shifted = target + np.array([[[0, roi_top]]], dtype=target.dtype)
-        cv2.drawContours(vis, [target_shifted], -1, (0, 255, 255), 2)
+        if debug_overlay_enabled:
+            target_shifted = target + np.array([[[0, roi_top]]], dtype=target.dtype)
+            cv2.drawContours(vis, [target_shifted], -1, (0, 255, 255), 2)
 
         # 最大輪郭のみ塗りつぶしマスク化（幅計測/3点抽出を安定化）
         target_mask = np.zeros_like(mask)
@@ -765,6 +1057,8 @@ class CameraReceiver:
                     best_seed = (r, cx, seg_w)
 
         if best_seed is None:
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -844,6 +1138,8 @@ class CameraReceiver:
         tracked_widths = [seed_w] + up_widths + down_widths
 
         if len(tracked_rows) < 8:
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -860,6 +1156,8 @@ class CameraReceiver:
         valid_widths = tracked_widths_np[unique_idx]
 
         if valid_rows.size < 8:
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -874,6 +1172,8 @@ class CameraReceiver:
             valid_widths = valid_widths[stable_mask]
 
         if valid_rows.size < 8:
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -922,6 +1222,8 @@ class CameraReceiver:
                     1,
                     cv2.LINE_AA,
                 )
+            if self._apply_simple_line_fallback(vis, roi_top, y1, y2, h, w, debug_overlay_enabled):
+                return vis
             self._on_detection_lost()
             self._set_latest_line_features(features)
             return vis
@@ -965,7 +1267,7 @@ class CameraReceiver:
             ],
             axis=1,
         )
-        if centerline_points.shape[0] >= 2:
+        if debug_overlay_enabled and centerline_points.shape[0] >= 2:
             pts_xy = np.ascontiguousarray(centerline_points[::2], dtype=np.int32)
             if pts_xy.shape[0] >= 2:
                 try:
@@ -986,16 +1288,17 @@ class CameraReceiver:
         # 全体幅（各行の幅の中央値）
         if draw_rows.size > 0:
             width_px = int(np.median(interp_widths[draw_rows]))
-            cv2.putText(
-                vis,
-                f"width={width_px}px",
-                (10, 44),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+            if debug_overlay_enabled:
+                cv2.putText(
+                    vis,
+                    f"width={width_px}px",
+                    (10, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             # 追跡中心を更新（下端ノイズに引っ張られすぎないよう少し上を採用）
             track_row = int(np.clip(roi_h * 0.65, valid_row_min, valid_row_max))
@@ -1037,18 +1340,19 @@ class CameraReceiver:
             features[f"line_offset_{zone_key}"] = float(np.clip(offset_norm, -1.0, 1.0))
             features[f"line_width_{zone_key}"] = float(np.clip(width_norm, 0.0, 1.0))
 
-            py = ay_global  # 表示位置は固定深度
-            cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
-            cv2.putText(
-                vis,
-                f"{name}:{wz}px",
-                (px + 8, py - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
+            if debug_overlay_enabled:
+                py = ay_global  # 表示位置は固定深度
+                cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
+                cv2.putText(
+                    vis,
+                    f"{name} x={px} y={py} w={wz}px off={offset_norm:+.2f}",
+                    (px + 8, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.43,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
 
         self._set_latest_line_features(features)
         return vis
@@ -1059,6 +1363,16 @@ class CameraReceiver:
         cam_socket.setsockopt(zmq.CONFLATE, 1)
         cam_socket.connect(f"tcp://{self.pi_ip}:{self.camera_port}")
 
+        feature_socket = None
+        if self.is_remote_line_feature_mode():
+            try:
+                feature_socket = ctx.socket(zmq.PULL)
+                feature_socket.setsockopt(zmq.CONFLATE, 1)
+                feature_socket.connect(f"tcp://{self.pi_ip}:{int(self.line_feature_port)}")
+            except Exception as exc:
+                self.logger.warning("Feature socket setup failed: %s", exc)
+                feature_socket = None
+
         frame_sizes = {
             320 * 240 * 3: (240, 320),
             640 * 480 * 3: (480, 640),
@@ -1066,25 +1380,57 @@ class CameraReceiver:
 
         try:
             while self._running:
+                received_any = False
                 try:
                     data = cam_socket.recv(flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
-                    time.sleep(0.01)
-                    continue
+                    data = None
                 try:
+                    if data is None:
+                        raise ValueError("no_frame")
                     shape_hw = frame_sizes.get(len(data))
                     if shape_hw is None:
-                        self.logger.debug("Unexpected frame size: %d", len(data))
-                        continue
-                    h, w = shape_hw
-                    img = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    if (w, h) != (640, 480):
-                        img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_LINEAR)
-                    with self._lock:
-                        self._image = img
+                        # JPEG経路（BGRで復元）
+                        jpeg_buf = np.frombuffer(data, dtype=np.uint8)
+                        img = cv2.imdecode(jpeg_buf, cv2.IMREAD_COLOR)
+                        if img is None:
+                            self.logger.debug("Unexpected frame size: %d", len(data))
+                        else:
+                            with self._lock:
+                                self._image = img
+                            received_any = True
+                    else:
+                        # 後方互換: 旧raw経路（RGB -> BGR）
+                        h, w = shape_hw
+                        img = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
+                        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                        with self._lock:
+                            self._image = img
+                        received_any = True
+                except ValueError:
+                    pass
                 except Exception as exc:
                     self.logger.debug("Frame decode failed: %s", exc)
+
+                if feature_socket is not None:
+                    try:
+                        packet = feature_socket.recv_json(flags=zmq.NOBLOCK)
+                        payload = packet.get("line_features", packet) if isinstance(packet, dict) else None
+                        if isinstance(payload, dict):
+                            normalized = self._normalize_line_features(payload)
+                            with self._lock:
+                                self._latest_line_features = normalized
+                                self._last_remote_feature_ts = time.perf_counter()
+                            received_any = True
+                    except zmq.ZMQError:
+                        pass
+                    except Exception as exc:
+                        self.logger.debug("Remote feature decode failed: %s", exc)
+
+                if not received_any:
+                    time.sleep(0.005)
         finally:
             cam_socket.close()
+            if feature_socket is not None:
+                feature_socket.close()
             ctx.term()

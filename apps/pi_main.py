@@ -19,7 +19,9 @@ from pid_learned_controller import LearnedPIDONNXController
 
 # Network ports used by legacy remote mode.
 CAMERA_PORT = 5556
+LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
+JPEG_QUALITY_REMOTE = 70
 
 # Command sign correction in remote mode.
 CMD_LEFT_SIGN = -1
@@ -329,6 +331,7 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
     last_line_ts = 0.0
     last_log_ts = 0.0
     cached_features = line_detector.get_latest_line_features()
+    next_frame_ts = time.perf_counter()
 
     print("[pid] Initializing camera...")
     picam2 = Picamera2()
@@ -359,7 +362,6 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
             now = time.perf_counter()
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -394,7 +396,12 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
                     last_log_ts = now
 
             if camera_sleep_sec > 0.0:
-                time.sleep(camera_sleep_sec)
+                next_frame_ts += camera_sleep_sec
+                wait_sec = next_frame_ts - time.perf_counter()
+                if wait_sec > 0.0:
+                    time.sleep(wait_sec)
+                else:
+                    next_frame_ts = time.perf_counter()
     except KeyboardInterrupt:
         print("Stopping pid mode...")
     finally:
@@ -402,15 +409,35 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
         picam2.stop()
 
 
-def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None:
+def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_path: str) -> None:
     running = True
+    logger = logging.getLogger("pi_remote")
+    logger.setLevel(logging.INFO)
+    runtime_cfg = load_runtime_config(config_path)
+
+    line_detector = CameraReceiver("127.0.0.1", 0, logger)
+    line_detector.set_debug_overlay_enabled(False)
+    line_detector.set_line_detection_profile_name(runtime_cfg.line_detection_profile)
+    line_detector.set_line_color_space(runtime_cfg.line_color_space)
+    line_detector.set_auto_threshold_enabled(bool(runtime_cfg.auto_threshold_enabled))
+    line_detector.set_thresholds(
+        far_threshold=int(runtime_cfg.far_threshold),
+        near_threshold=int(runtime_cfg.near_threshold),
+    )
+    line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
+    last_line_ts = 0.0
+    cached_features = line_detector.get_latest_line_features()
 
     def camera_thread() -> None:
-        nonlocal running
+        nonlocal running, last_line_ts, cached_features
         ctx = zmq.Context()
         sock = ctx.socket(zmq.PUSH)
         sock.setsockopt(zmq.CONFLATE, 1)
         sock.bind(f"tcp://*:{CAMERA_PORT}")
+
+        feature_sock = ctx.socket(zmq.PUSH)
+        feature_sock.setsockopt(zmq.CONFLATE, 1)
+        feature_sock.bind(f"tcp://*:{LINE_FEATURE_PORT}")
 
         print("[remote] Initializing camera...")
         picam2 = Picamera2()
@@ -427,18 +454,42 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float) -> None
         )
 
         sleep_sec = max(0.0, 1.0 / max(1e-6, camera_fps))
+        next_frame_ts = time.perf_counter()
         print("[remote] Camera stream thread started.")
         try:
             while running:
-                img = picam2.capture_array()
-                sock.send(img.tobytes())
+                now = time.perf_counter()
+                img_rgb = picam2.capture_array()
+                frame_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                if (now - last_line_ts) >= line_interval_sec:
+                    line_detector.find_line(frame_bgr)
+                    cached_features = line_detector.get_latest_line_features()
+                    last_line_ts = now
+
+                ok, enc = cv2.imencode(
+                    ".jpg",
+                    frame_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY_REMOTE)],
+                )
+                if ok:
+                    sock.send(enc.tobytes())
+                else:
+                    # エンコード失敗時のみ後方互換のraw送信にフォールバック
+                    sock.send(img_rgb.tobytes())
+                feature_sock.send_json({"line_features": cached_features})
                 if sleep_sec > 0.0:
-                    time.sleep(sleep_sec)
+                    next_frame_ts += sleep_sec
+                    wait_sec = next_frame_ts - time.perf_counter()
+                    if wait_sec > 0.0:
+                        time.sleep(wait_sec)
+                    else:
+                        next_frame_ts = time.perf_counter()
         except Exception as exc:
             print(f"Camera thread error: {exc}")
         finally:
             picam2.stop()
             sock.close()
+            feature_sock.close()
             ctx.term()
 
     cam_thread = threading.Thread(target=camera_thread, daemon=True)
@@ -515,6 +566,7 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
     last_control_ts = 0.0
     last_line_ts = 0.0
     cached_features = line_detector.get_latest_line_features()
+    next_frame_ts = time.perf_counter()
 
     print("[local_ai] Initializing camera...")
     picam2 = Picamera2()
@@ -546,7 +598,6 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
 
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -572,7 +623,12 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
                 last_control_ts = now
 
             if camera_sleep_sec > 0.0:
-                time.sleep(camera_sleep_sec)
+                next_frame_ts += camera_sleep_sec
+                wait_sec = next_frame_ts - time.perf_counter()
+                if wait_sec > 0.0:
+                    time.sleep(wait_sec)
+                else:
+                    next_frame_ts = time.perf_counter()
     except KeyboardInterrupt:
         print("Stopping local AI mode...")
     finally:
@@ -628,6 +684,7 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
     last_line_ts = 0.0
     last_log_ts = 0.0
     cached_features = line_detector.get_latest_line_features()
+    next_frame_ts = time.perf_counter()
 
     print("[pid_learned] Initializing camera...")
     picam2 = Picamera2()
@@ -652,7 +709,6 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
 
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            frame_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
 
             if (now - last_line_ts) >= line_interval_sec:
                 line_detector.find_line(frame_bgr)
@@ -686,7 +742,12 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
                     last_log_ts = now
 
             if camera_sleep_sec > 0.0:
-                time.sleep(camera_sleep_sec)
+                next_frame_ts += camera_sleep_sec
+                wait_sec = next_frame_ts - time.perf_counter()
+                if wait_sec > 0.0:
+                    time.sleep(wait_sec)
+                else:
+                    next_frame_ts = time.perf_counter()
     except KeyboardInterrupt:
         print("Stopping pid_learned mode...")
     finally:
@@ -751,6 +812,11 @@ if __name__ == "__main__":
         elif args.mode == "pid_learned":
             run_pid_learned_mode(args, pwm_a, pwm_b)
         else:
-            run_remote_mode(pwm_a, pwm_b, camera_fps=args.camera_fps)
+            run_remote_mode(
+                pwm_a,
+                pwm_b,
+                camera_fps=args.camera_fps,
+                config_path=args.config_path,
+            )
     finally:
         safe_shutdown_gpio(pwm_a, pwm_b)

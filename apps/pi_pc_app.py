@@ -26,6 +26,7 @@ RADIUS = 120
 STICK_RADIUS = 30
 DEADZONE = 35
 CAMERA_PORT = 5556
+LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
 LEFT_SIGN = 1
 RIGHT_SIGN = 1
@@ -55,8 +56,78 @@ class _LineDetectionWorker:
         self._lock = threading.Lock()
         self._latest_vis: Optional[np.ndarray] = None
         self._latest_features: Dict[str, float] = camera_receiver.get_latest_line_features()
+        self._remote_stale_logged = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    @staticmethod
+    def _draw_remote_feature_overlay(frame: np.ndarray, features: Dict[str, float]) -> np.ndarray:
+        vis = frame.copy()
+        h, w = vis.shape[:2]
+        roi_top = int(h * 0.25)
+        roi_available = h - roi_top
+        y1 = roi_top + (roi_available // 3)
+        y2 = roi_top + ((2 * roi_available) // 3)
+        zone_rows = {
+            "top": (roi_top + y1) // 2,
+            "mid": (y1 + y2) // 2,
+            "bottom": (y2 + h) // 2,
+        }
+        zone_colors = {
+            "top": (0, 220, 220),
+            "mid": (0, 220, 120),
+            "bottom": (0, 255, 0),
+        }
+
+        cv2.line(vis, (0, y1), (w - 1, y1), (90, 90, 90), 1)
+        cv2.line(vis, (0, y2), (w - 1, y2), (90, 90, 90), 1)
+
+        line_points: List[Tuple[int, int]] = []
+        detect_count = 0
+        for zone_key in ("top", "mid", "bottom"):
+            y = int(zone_rows[zone_key])
+            color = zone_colors[zone_key]
+            detect = float(features.get(f"line_detect_{zone_key}", 0.0))
+            if detect <= 0.0:
+                continue
+
+            detect_count += 1
+            offset = float(np.clip(features.get(f"line_offset_{zone_key}", 0.0), -1.0, 1.0))
+            width_norm = float(np.clip(features.get(f"line_width_{zone_key}", 0.0), 0.0, 1.0))
+            x = int(np.clip((w * 0.5) + (offset * (w * 0.5)), 0, w - 1))
+            half_w = int(max(3, round((width_norm * w) * 0.5)))
+
+            line_points.append((x, y))
+            cv2.circle(vis, (x, y), 6, color, -1)
+            cv2.line(vis, (max(0, x - half_w), y), (min(w - 1, x + half_w), y), color, 2)
+            cv2.putText(
+                vis,
+                f"{zone_key} x={x} y={y} off={offset:+.2f} w={int(width_norm * w)}",
+                (min(w - 120, x + 8), max(14, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        if len(line_points) >= 2:
+            pts = np.array(line_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(vis, [pts], False, (255, 255, 0), 2)
+
+        status_text = "remote_line: ok" if detect_count > 0 else "remote_line: none"
+        status_color = (0, 255, 255) if detect_count > 0 else (0, 120, 255)
+        cv2.putText(
+            vis,
+            status_text,
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            status_color,
+            2,
+            cv2.LINE_AA,
+        )
+        return vis
 
     def start(self) -> None:
         if self._running:
@@ -66,14 +137,38 @@ class _LineDetectionWorker:
         self._thread.start()
 
     def _run(self) -> None:
+        next_tick = time.perf_counter()
         while self._running:
             frame = self._camera_receiver.get_latest_frame()
-            vis = self._camera_receiver.find_line(frame)
-            features = self._camera_receiver.get_latest_line_features()
+            if self._camera_receiver.is_remote_line_feature_mode():
+                features = self._camera_receiver.get_latest_line_features()
+                remote_age = self._camera_receiver.get_remote_feature_age_sec()
+                has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
+                if has_recent_remote:
+                    vis = self._draw_remote_feature_overlay(frame, features)
+                    self._remote_stale_logged = False
+                else:
+                    vis = self._camera_receiver.find_line(frame)
+                    features = self._camera_receiver.get_latest_line_features()
+                    if not self._remote_stale_logged:
+                        logging.getLogger("pi_pc_app").warning(
+                            "Remote line features stale/missing. Falling back to local find_line()."
+                        )
+                        self._remote_stale_logged = True
+            else:
+                vis = self._camera_receiver.find_line(frame)
+                features = self._camera_receiver.get_latest_line_features()
             with self._lock:
                 self._latest_vis = vis
                 self._latest_features = features
-            time.sleep(self._interval)
+
+            next_tick += self._interval
+            sleep_sec = next_tick - time.perf_counter()
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
+            else:
+                # 処理が間隔を超過した場合はドリフトをリセット
+                next_tick = time.perf_counter()
 
     def get_latest(self) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
         with self._lock:
@@ -123,7 +218,12 @@ class UnifiedApp:
             inner_speed_scale=INNER_SPEED_SCALE,
         )
 
-        self.camera_receiver = CameraReceiver(PI_IP, CAMERA_PORT, self.logger)
+        self.camera_receiver = CameraReceiver(
+            PI_IP,
+            CAMERA_PORT,
+            self.logger,
+            line_feature_port=LINE_FEATURE_PORT,
+        )
         self.camera_receiver.set_line_detection_profile_name(self.config.line_detection_profile)
         self.camera_receiver.set_line_color_space(self.config.line_color_space)
         self.camera_receiver.set_auto_threshold_enabled(bool(self.config.auto_threshold_enabled))

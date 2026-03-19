@@ -5,7 +5,10 @@ line_detection_rules
 
 from typing import Optional
 
-from .line_detection_config import ContourRuleConfig, PostTrackRejectConfig, SoftRecoverConfig
+try:
+    from .line_detection_config import ContourRuleConfig, PostTrackRejectConfig, SoftRecoverConfig
+except ImportError:
+    from line_detection_config import ContourRuleConfig, PostTrackRejectConfig, SoftRecoverConfig
 
 
 def is_blob_fill(fill_ratio: float, aspect: float, cfg: ContourRuleConfig) -> bool:
