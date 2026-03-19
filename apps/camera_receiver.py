@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -37,9 +38,12 @@ class CameraReceiver:
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._lost_feature_hold_frames = 8
-        self._offset_jump_threshold: float = 0.45
-        self._feature_smoothing_alpha: float = 0.30
-        self._offset_deadband: float = 0.015
+        self._offset_jump_threshold: float = 0.28
+        self._feature_smoothing_alpha: float = 0.22
+        self._offset_deadband: float = 0.02
+        self._feature_history_len: int = 5
+        self._offset_histories = {"top": deque(maxlen=self._feature_history_len), "mid": deque(maxlen=self._feature_history_len), "bottom": deque(maxlen=self._feature_history_len)}
+        self._width_histories = {"top": deque(maxlen=self._feature_history_len), "mid": deque(maxlen=self._feature_history_len), "bottom": deque(maxlen=self._feature_history_len)}
         self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
         self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
@@ -119,13 +123,15 @@ class CameraReceiver:
             self._prev_center_x = None
             for zone in ("top", "mid", "bottom"):
                 self._prev_accepted_offsets[zone] = None
+                self._offset_histories[zone].clear()
+                self._width_histories[zone].clear()
 
     def _on_detection_success(self, center_x: float) -> None:
         if self._prev_center_x is None:
             self._prev_center_x = float(center_x)
         else:
             # 急なジャンプを抑えるため、検出中心を緩やかに追従
-            self._prev_center_x = 0.7 * float(self._prev_center_x) + 0.3 * float(center_x)
+            self._prev_center_x = 0.82 * float(self._prev_center_x) + 0.18 * float(center_x)
         self._consecutive_misses = 0
 
     def _default_line_features(self) -> Dict[str, float]:
@@ -184,8 +190,20 @@ class CameraReceiver:
                         if abs(smoothed_offset) < float(self._offset_deadband):
                             smoothed_offset = 0.0
 
-                        incoming[offset_key] = float(np.clip(smoothed_offset, -1.0, 1.0))
-                        incoming[width_key] = float(np.clip(smoothed_width, 0.0, 1.0))
+                        smoothed_offset = float(np.clip(smoothed_offset, -1.0, 1.0))
+                        smoothed_width = float(np.clip(smoothed_width, 0.0, 1.0))
+
+                        # 単発ノイズ抑制: 直近履歴の中央値でロバスト化
+                        self._offset_histories[zone].append(smoothed_offset)
+                        self._width_histories[zone].append(smoothed_width)
+                        med_offset = float(np.median(np.array(self._offset_histories[zone], dtype=np.float32)))
+                        med_width = float(np.median(np.array(self._width_histories[zone], dtype=np.float32)))
+
+                        stable_offset = 0.65 * med_offset + 0.35 * smoothed_offset
+                        stable_width = 0.65 * med_width + 0.35 * smoothed_width
+
+                        incoming[offset_key] = float(np.clip(stable_offset, -1.0, 1.0))
+                        incoming[width_key] = float(np.clip(stable_width, 0.0, 1.0))
                         self._prev_accepted_offsets[zone] = float(incoming[offset_key])
 
             incoming_detect_sum = (
@@ -542,12 +560,15 @@ class CameraReceiver:
         soft_best_score = -1.0
         soft_best_idx = None
         soft_best_cnt = None
+        soft_near_anchor = int(np.clip(roi_h * 0.62, 0, roi_h - 1))
         for idx, cnt in enumerate(contours):
             area = float(cv2.contourArea(cnt))
             x, y, bw, bh = cv2.boundingRect(cnt)
             span_ratio = float(bh) / max(1.0, float(roi_h))
             bw_ratio = float(bw) / max(1.0, float(frame_width))
             fill_ratio = area / max(1.0, float(bw * bh)) if bw > 0 and bh > 0 else 0.0
+            avg_row_width = area / max(1.0, float(bh))
+            mid_allowed_width = float(max_segment_width_px(int(y + (bh * 0.5))))
             touch_left = x <= 2
             touch_right = (x + bw) >= (frame_width - 2)
 
@@ -565,6 +586,17 @@ class CameraReceiver:
             cx = float(x) + (0.5 * float(bw))
             bottom_reach = float(y + bh) / max(1.0, float(roi_h))
             aspect = float(bh) / max(1.0, float(bw))
+
+            # soft recover は誤検出を拾いやすいため、近距離支持と縦長性を最低条件にする
+            has_soft_near_support = (y + bh) >= soft_near_anchor
+            if not has_soft_near_support:
+                continue
+            if aspect < 0.95:
+                continue
+            if avg_row_width > (mid_allowed_width * 1.35):
+                continue
+            if bottom_reach < 0.56:
+                continue
 
             if self._prev_center_x is not None and self._consecutive_misses < 4:
                 center_ref = float(self._prev_center_x)
@@ -859,6 +891,9 @@ class CameraReceiver:
         near_width_med = float(np.median(valid_widths[near_rows_mask])) if near_rows_count > 0 else 0.0
         span_rows = int(valid_rows.max() - valid_rows.min() + 1)
         span_ratio_rows = float(span_rows) / max(1.0, float(roi_h))
+        center_step_p90 = 0.0
+        if valid_centers.size >= 3:
+            center_step_p90 = float(np.percentile(np.abs(np.diff(valid_centers)), 90))
 
         post_reject_reason = evaluate_post_track_reject_reason(
             width_med=width_med,
@@ -871,6 +906,10 @@ class CameraReceiver:
             span_ratio_rows=span_ratio_rows,
             cfg=cfg.post_track,
         )
+        if post_reject_reason is None and using_soft_recover:
+            soft_jitter_limit = max(14.0, 0.09 * float(w))
+            if center_step_p90 > soft_jitter_limit:
+                post_reject_reason = "soft_jitter"
         if post_reject_reason is not None:
             if debug_overlay_enabled:
                 cv2.putText(
@@ -982,7 +1021,7 @@ class CameraReceiver:
                 continue
 
             # 単一行だと行ノイズで揺れやすいので近傍行の中央値を採用
-            win_half = 3
+            win_half = 5
             wy0 = int(max(valid_row_min, ay - win_half))
             wy1 = int(min(valid_row_max, ay + win_half))
             row_win = np.arange(wy0, wy1 + 1, dtype=np.int32)

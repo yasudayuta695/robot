@@ -19,16 +19,19 @@ ai_no_line_hold_frames=4
 # ライン見失い後の減速に使うフレーム数
 ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
-line_process_interval_ms=70
+line_process_interval_ms=45
 # カメラ配信プロファイル（low_latency / high_quality）
 # 低遅延重視は low_latency，画質重視は high_quality
 camera_stream_profile=low_latency
 # ライン抽出の色空間（lab または hsv）
-line_color_space=hsv
+line_color_space=lab
 # ライン検出プロファイル（default=panel_seam_glare / panel_seam / glare / panel_seam_glare）
-line_detection_profile=default
+line_detection_profile=panel_seam
 # しきい値自動補正（見失いが多い場合は true 推奨）
-auto_threshold_enabled=true
+auto_threshold_enabled=false
+# 固定しきい値（auto_threshold_enabled=false のとき有効）
+far_threshold=84
+near_threshold=76
 # AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
 ai_control_interval_ms=100
 # UI更新周期(ms)
