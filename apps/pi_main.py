@@ -487,10 +487,8 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
         picam2.start()
         picam2.set_controls(
             {
-                "AeEnable": False,
-                "AwbEnable": False,
-                "ExposureTime": 7000,
-                "AnalogueGain": 1.0,
+                "AeEnable": True,
+                "AwbEnable": True,
             }
         )
 

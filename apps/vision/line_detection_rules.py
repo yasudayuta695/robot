@@ -147,7 +147,7 @@ def evaluate_contour_reject_reason(
         return "edge_blob"
     if is_edge_strip(touch_left, touch_right, bw_ratio, span_ratio, fill_ratio, aspect, cfg):
         return "edge_strip"
-    if is_full_span(touch_left, touch_right, bw_ratio, cfg):
+    if is_full_span(touch_left, touch_right, bw_ratio, cfg) and fill_ratio > cfg.full_span_fill_ratio_min:
         return "full_span"
     if is_vertical_blob(touch_top, touch_bottom, bw_ratio, fill_ratio, aspect, cfg):
         return "vertical_blob"

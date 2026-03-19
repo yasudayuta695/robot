@@ -604,7 +604,7 @@ class CameraReceiver:
             mask = mask & (corridor_mask.view(np.uint8) * 255)
 
             # corridor が厳しすぎて消失する場合は、当該フレームのみ corridor を外す。
-            if cv2.countNonZero(mask) < int(max(24, mask.size * 0.0015)):
+            if cv2.countNonZero(mask) < int(max(24, mask.size * 0.004)):
                 mask = global_mask.copy()
 
         kernel_far = np.ones((2, 2), np.uint8)
