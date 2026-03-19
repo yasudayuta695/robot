@@ -1030,11 +1030,12 @@ class UnifiedApp:
         self.camera_label.config(image=tk_image)
         self.camera_label.image = tk_image
 
-        self._append_coordinate_stream(
-            line_features=line_features,
-            frame_w=display_frame.shape[1],
-            frame_h=display_frame.shape[0],
-        )
+        if self.recorder.state == RecorderState.RECORDING:
+            self._append_coordinate_stream(
+                line_features=line_features,
+                frame_w=display_frame.shape[1],
+                frame_h=display_frame.shape[0],
+            )
 
         self.recorder.record_frame(
             image_rgb=frame,
