@@ -23,6 +23,11 @@ class AppConfig:
     line_process_interval_ms: int
     ai_control_interval_ms: int
     ui_update_interval_ms: int
+    line_color_space: str
+    line_detection_profile: str
+    far_threshold: int
+    near_threshold: int
+    auto_threshold_enabled: bool
     camera_ids: List[str]
     default_camera_id: str
 
@@ -80,6 +85,11 @@ def load_config(
     configured_line_process_interval_ms = 70
     configured_ai_control_interval_ms = 100
     configured_ui_update_interval_ms = 30
+    configured_line_color_space = "lab"
+    configured_line_detection_profile = "default"
+    configured_far_threshold = 100
+    configured_near_threshold = 70
+    configured_auto_threshold_enabled = True
     configured_camera_ids: List[str] = []
     configured_default_camera_id = ""
     drive_types: List[str] = []
@@ -156,6 +166,28 @@ def load_config(
                         configured_ui_update_interval_ms = int(float(value))
                     except ValueError:
                         logger.warning("Invalid ui_update_interval_ms: %s", value)
+                elif key == "line_color_space" and value:
+                    configured_line_color_space = str(value).strip().lower()
+                elif key == "line_detection_profile" and value:
+                    configured_line_detection_profile = str(value).strip().lower()
+                elif key == "far_threshold" and value:
+                    try:
+                        configured_far_threshold = int(float(value))
+                    except ValueError:
+                        logger.warning("Invalid far_threshold: %s", value)
+                elif key == "near_threshold" and value:
+                    try:
+                        configured_near_threshold = int(float(value))
+                    except ValueError:
+                        logger.warning("Invalid near_threshold: %s", value)
+                elif key == "auto_threshold_enabled" and value:
+                    lowered = str(value).strip().lower()
+                    if lowered in {"1", "true", "yes", "on"}:
+                        configured_auto_threshold_enabled = True
+                    elif lowered in {"0", "false", "no", "off"}:
+                        configured_auto_threshold_enabled = False
+                    else:
+                        logger.warning("Invalid auto_threshold_enabled: %s", value)
                 elif key == "camera_id" and value:
                     configured_camera_ids.append(value)
                 elif key == "default_camera_id" and value:
@@ -193,6 +225,11 @@ def load_config(
     configured_line_process_interval_ms = max(20, min(300, int(configured_line_process_interval_ms)))
     configured_ai_control_interval_ms = max(20, min(300, int(configured_ai_control_interval_ms)))
     configured_ui_update_interval_ms = max(10, min(100, int(configured_ui_update_interval_ms)))
+    configured_line_color_space = "hsv" if configured_line_color_space == "hsv" else "lab"
+    if configured_line_detection_profile not in {"default", "panel_seam", "glare", "panel_seam_glare"}:
+        configured_line_detection_profile = "default"
+    configured_far_threshold = max(0, min(255, int(configured_far_threshold)))
+    configured_near_threshold = max(0, min(255, int(configured_near_threshold)))
 
     if not configured_camera_ids:
         configured_camera_ids = ["camera_1", "camera_2"]
@@ -216,6 +253,11 @@ def load_config(
         line_process_interval_ms=configured_line_process_interval_ms,
         ai_control_interval_ms=configured_ai_control_interval_ms,
         ui_update_interval_ms=configured_ui_update_interval_ms,
+        line_color_space=configured_line_color_space,
+        line_detection_profile=configured_line_detection_profile,
+        far_threshold=configured_far_threshold,
+        near_threshold=configured_near_threshold,
+        auto_threshold_enabled=bool(configured_auto_threshold_enabled),
         camera_ids=configured_camera_ids,
         default_camera_id=configured_default_camera_id,
     )

@@ -40,7 +40,7 @@ class CameraReceiver:
         self._offset_jump_threshold: float = 0.45
         self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
         self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
-        self._line_detection_config = LineDetectionConfig()
+        self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 

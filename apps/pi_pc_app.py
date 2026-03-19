@@ -124,6 +124,13 @@ class UnifiedApp:
         )
 
         self.camera_receiver = CameraReceiver(PI_IP, CAMERA_PORT, self.logger)
+        self.camera_receiver.set_line_detection_profile_name(self.config.line_detection_profile)
+        self.camera_receiver.set_line_color_space(self.config.line_color_space)
+        self.camera_receiver.set_auto_threshold_enabled(bool(self.config.auto_threshold_enabled))
+        self.camera_receiver.set_thresholds(
+            far_threshold=int(self.config.far_threshold),
+            near_threshold=int(self.config.near_threshold),
+        )
         self.camera_receiver.start()
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
