@@ -118,8 +118,17 @@ class CameraReceiver:
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
         self._calibrated_width_norm: Optional[float] = None
         self._last_width_med_norm: float = 0.0
+        self._show_binary_mask: bool = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def set_show_binary_mask(self, enabled: bool) -> None:
+        with self._lock:
+            self._show_binary_mask = bool(enabled)
+
+    def is_show_binary_mask(self) -> bool:
+        with self._lock:
+            return self._show_binary_mask
 
     def is_remote_line_feature_mode(self) -> bool:
         return self.line_feature_port is not None and int(self.line_feature_port) > 0
@@ -251,6 +260,11 @@ class CameraReceiver:
     def get_calibrated_width_norm(self) -> Optional[float]:
         with self._lock:
             return self._calibrated_width_norm
+
+    def set_calibrated_width_norm(self, value: Optional[float]) -> None:
+        """外部から直接キャリブレーション値を設定する（remote mode でPC→Pi 送信用）。"""
+        with self._lock:
+            self._calibrated_width_norm = float(value) if value is not None else None
 
     def clear_calibrated_width(self) -> None:
         with self._lock:
@@ -993,7 +1007,8 @@ class CameraReceiver:
 
     def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
         debug_overlay_enabled = self.is_debug_overlay_enabled()
-        vis = img.copy() if debug_overlay_enabled else img
+        show_binary = self.is_show_binary_mask()
+        vis = img.copy() if (debug_overlay_enabled or show_binary) else img
         h, w = vis.shape[:2]
         features = self._default_line_features()
 
@@ -1004,6 +1019,12 @@ class CameraReceiver:
             roi_top=roi_top,
             frame_width=w,
         )
+
+        if show_binary:
+            # マスクを BGR に変換して vis を差し替え（検出オーバーレイはこの上に描く）
+            mask_full = np.zeros((h, w), dtype=np.uint8)
+            mask_full[roi_top:, :] = mask
+            vis = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
 
         # 3分割ガイド（遠/中/近）: ROI内を均等3分割
         _roi_available = h - roi_top

@@ -6,6 +6,7 @@ import time
 import datetime
 import cv2
 import numpy as np
+import zmq
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -29,6 +30,7 @@ DEADZONE = 35
 CAMERA_PORT = 5556
 LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
+CALIB_PORT = 5558
 LEFT_SIGN = 1
 RIGHT_SIGN = 1
 PIVOT_Y_THRESHOLD = 0.15
@@ -147,7 +149,8 @@ class _LineDetectionWorker:
         next_tick = time.perf_counter()
         while self._running:
             frame = self._camera_receiver.get_latest_frame()
-            if self._camera_receiver.is_remote_line_feature_mode():
+            show_binary = self._camera_receiver.is_show_binary_mask()
+            if self._camera_receiver.is_remote_line_feature_mode() and not show_binary:
                 features = self._camera_receiver.get_latest_line_features()
                 remote_age = self._camera_receiver.get_remote_feature_age_sec()
                 has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
@@ -242,6 +245,10 @@ class UnifiedApp:
         self.camera_receiver.start()
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
+        self._calib_zmq_ctx = zmq.Context()
+        self._calib_sock = self._calib_zmq_ctx.socket(zmq.PUSH)
+        self._calib_sock.setsockopt(zmq.SNDHWM, 1)
+        self._calib_sock.connect(f"tcp://{PI_IP}:{CALIB_PORT}")
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
         self.ai_controller = LearnedPIDONNXController(
             history=10,
@@ -429,6 +436,15 @@ class UnifiedApp:
             command=self.on_toggle_debug_overlay,
         )
         self.debug_overlay_check.pack(side=tk.LEFT, padx=(12, 0))
+
+        self.show_binary_var = tk.BooleanVar(value=False)
+        self.show_binary_check = tk.Checkbutton(
+            self.threshold_frame,
+            text="二値化表示",
+            variable=self.show_binary_var,
+            command=self.on_toggle_show_binary,
+        )
+        self.show_binary_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.offset_filter_frame = tk.Frame(self.main_frame)
         self.offset_filter_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
@@ -730,6 +746,10 @@ class UnifiedApp:
         else:
             self.logger.info("黒ライン閾値の自動補正: OFF")
 
+    def on_toggle_show_binary(self) -> None:
+        enabled = bool(self.show_binary_var.get())
+        self.camera_receiver.set_show_binary_mask(enabled)
+
     def on_toggle_debug_overlay(self) -> None:
         enabled = self.camera_receiver.set_debug_overlay_enabled(bool(self.debug_overlay_var.get()))
         self.debug_overlay_var.set(enabled)
@@ -746,11 +766,19 @@ class UnifiedApp:
         else:
             self.calib_width_label.config(text=f"{w_norm:.3f} (norm)", fg="green")
             self.logger.info("幅キャリブレーション設定: %.3f (norm)", w_norm)
+            try:
+                self._calib_sock.send_json({"calib_width_norm": w_norm}, flags=zmq.NOBLOCK)
+            except zmq.ZMQError as exc:
+                self.logger.warning("Pi へのキャリブ送信失敗: %s", exc)
 
     def on_clear_calibrated_width(self) -> None:
         self.camera_receiver.clear_calibrated_width()
         self.calib_width_label.config(text="未設定", fg="gray50")
         self.logger.info("幅キャリブレーションをクリア")
+        try:
+            self._calib_sock.send_json({"calib_width_norm": None}, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as exc:
+            self.logger.warning("Pi へのキャリブクリア送信失敗: %s", exc)
 
     def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
         self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
@@ -1164,6 +1192,8 @@ class UnifiedApp:
         self.recorder.close_and_discard_on_exit()
         self.camera_receiver.stop()
         self.motor_client.close()
+        self._calib_sock.close()
+        self._calib_zmq_ctx.term()
         self.root.unbind_all("<KeyPress>")
         self.root.unbind_all("<KeyRelease>")
         self.root.destroy()

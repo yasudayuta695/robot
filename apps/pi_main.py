@@ -21,6 +21,7 @@ from pid_learned_controller import LearnedPIDONNXController
 CAMERA_PORT = 5556
 LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
+CALIB_PORT = 5558
 JPEG_QUALITY_REMOTE = 70
 
 # Command sign correction in remote mode.
@@ -531,8 +532,34 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
             feature_sock.close()
             ctx.term()
 
+    def calib_receive_thread() -> None:
+        nonlocal running
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.PULL)
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        sock.bind(f"tcp://*:{CALIB_PORT}")
+        print("[remote] Calibration receive thread started.")
+        try:
+            while running:
+                try:
+                    msg = sock.recv_json()
+                    w_norm = msg.get("calib_width_norm")
+                    if w_norm is None:
+                        line_detector.clear_calibrated_width()
+                        print("[remote] Calibration cleared.")
+                    else:
+                        line_detector.set_calibrated_width_norm(float(w_norm))
+                        print(f"[remote] Calibration set: {w_norm:.4f}")
+                except zmq.ZMQError:
+                    pass
+        finally:
+            sock.close()
+            ctx.term()
+
     cam_thread = threading.Thread(target=camera_thread, daemon=True)
     cam_thread.start()
+    calib_thread = threading.Thread(target=calib_receive_thread, daemon=True)
+    calib_thread.start()
 
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
