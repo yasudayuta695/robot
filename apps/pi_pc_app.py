@@ -150,25 +150,33 @@ class _LineDetectionWorker:
         while self._running:
             frame = self._camera_receiver.get_latest_frame()
             show_binary = self._camera_receiver.is_show_binary_mask()
+
+            use_pi = False
             if self._camera_receiver.is_remote_line_feature_mode() and not show_binary:
-                features = self._camera_receiver.get_latest_line_features()
                 remote_age = self._camera_receiver.get_remote_feature_age_sec()
                 has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
                 if has_recent_remote:
-                    calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
-                    vis = self._draw_remote_feature_overlay(frame, features, calib_done=calib_done)
-                    self._remote_stale_logged = False
-                else:
-                    vis = self._camera_receiver.find_line(frame)
-                    features = self._camera_receiver.get_latest_line_features()
-                    if not self._remote_stale_logged:
-                        logging.getLogger("pi_pc_app").warning(
-                            "Remote line features stale/missing. Falling back to local find_line()."
-                        )
-                        self._remote_stale_logged = True
+                    pi_features = self._camera_receiver.get_latest_line_features()
+                    pi_detected = any(
+                        pi_features.get(f"line_detect_{z}", 0.0) > 0.0
+                        for z in ("top", "mid", "bottom")
+                    )
+                    if pi_detected:
+                        use_pi = True
+
+            if use_pi:
+                # Pi 検出成功 → 生フレーム処理の結果を採用
+                calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+                vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
+                features = pi_features
+                self._remote_stale_logged = False
             else:
+                # Pi 検出失敗 or 二値化表示 → PC 側でキャリブ込みの find_line() を実行
+                if not show_binary and not self._remote_stale_logged:
+                    logging.getLogger("pi_pc_app").debug("Pi detection failed. Running local find_line().")
                 vis = self._camera_receiver.find_line(frame)
                 features = self._camera_receiver.get_latest_line_features()
+
             with self._lock:
                 self._latest_vis = vis
                 self._latest_features = features
@@ -247,8 +255,13 @@ class UnifiedApp:
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
         self._calib_zmq_ctx = zmq.Context()
         self._calib_sock = self._calib_zmq_ctx.socket(zmq.PUSH)
-        self._calib_sock.setsockopt(zmq.SNDHWM, 1)
+        self._calib_sock.setsockopt(zmq.SNDHWM, 4)
         self._calib_sock.connect(f"tcp://{PI_IP}:{CALIB_PORT}")
+        self._calib_resend_stop = threading.Event()
+        self._calib_resend_thread = threading.Thread(
+            target=self._calib_resend_loop, daemon=True
+        )
+        self._calib_resend_thread.start()
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
         self.ai_controller = LearnedPIDONNXController(
             history=10,
@@ -758,6 +771,18 @@ class UnifiedApp:
         else:
             self.logger.info("Debug Overlay: OFF")
 
+    def _calib_resend_loop(self) -> None:
+        """キャリブ値が設定されている間、3秒ごとに Pi へ再送する。"""
+        while not self._calib_resend_stop.wait(timeout=3.0):
+            w_norm = self.camera_receiver.get_calibrated_width_norm()
+            try:
+                self._calib_sock.send_json(
+                    {"calib_width_norm": w_norm},
+                    flags=zmq.NOBLOCK,
+                )
+            except zmq.ZMQError:
+                pass
+
     def on_calibrate_width(self) -> None:
         w_norm = self.camera_receiver.calibrate_straight_width()
         if w_norm is None:
@@ -1192,6 +1217,8 @@ class UnifiedApp:
         self.recorder.close_and_discard_on_exit()
         self.camera_receiver.stop()
         self.motor_client.close()
+        self._calib_resend_stop.set()
+        self._calib_resend_thread.join(timeout=4.0)
         self._calib_sock.close()
         self._calib_zmq_ctx.term()
         self.root.unbind_all("<KeyPress>")
