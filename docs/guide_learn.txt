@@ -113,9 +113,71 @@ C++ で書き直しても効果は薄い（推論の本体は NCNN の C++ カ�
 
 ### アノテーションツール
 
-- **LabelMe**（推奨）: ポリゴン選択・ブラシ塗り、ローカル動作、PNG マスク出力対応
-- CVAT: Web UI、チーム向け
-- 自作 GUI: 既存走行ログと連携しやすい場合に検討
+`tools/` ディレクトリに専用スクリプトを用意している。
+
+| スクリプト | 役割 |
+|---|---|
+| `tools/generate_masks.py` | ルールベース検出でマスクを自動生成（下書き） |
+| `tools/annotate_masks.py` | GUI でマスクを修正・確定 |
+
+#### データ収集コマンド
+
+```bash
+# ① Pi 側を起動（remote モード）
+python apps/pi/pi_main.py --mode remote
+
+# ② PC 側を起動
+python apps/pc/pi_pc_app.py
+# → コースを走らせながら「録画開始」ボタンを押す
+# → 走り終わったら停止 → データをコミット
+```
+
+保存先: `dataset/<camera_id>/<drive_type>/<timestamp>/`
+
+```
+dataset/camera_1/straight/20260316_133810_941565/
+  image/          ← Pi カメラの生フレーム（ML 入力に使う）
+  mask/           ← アノテーションマスク（generate_masks.py が生成）
+  driving_log.csv ← detect/offset/モータ値（制御モデル学習に使う）
+  recording_summary.txt
+```
+
+#### 収集時に意識すること
+
+| 場面 | 理由 |
+|---|---|
+| カーブ進入・脱出を多めに録る | 検出が不安定な場面 = モデルが最も必要な場面 |
+| 誤検出が出る場面も録る | ノイズ・影・継ぎ目があるシーンを学習させる |
+| 速度を変えて録る | 速い・遅いでブレや露光が変わる |
+| 照明条件を変える | 環境変化への汎化のため |
+
+#### マスク自動生成コマンド
+
+```bash
+# 特定セッション 1 つ
+python tools/generate_masks.py dataset/camera_1/straight/20260316_133810_941565
+
+# dataset/ 以下の全セッションをまとめて処理
+python tools/generate_masks.py --all dataset/
+
+# 既存マスクを上書きする場合
+python tools/generate_masks.py --all dataset/ --overwrite
+```
+
+#### アノテーション GUI コマンド
+
+```bash
+python tools/annotate_masks.py dataset/camera_1/straight/20260316_133810_941565
+```
+
+| 操作 | 動作 |
+|---|---|
+| 左ドラッグ | コース領域を塗る |
+| 右ドラッグ | マスクを消す |
+| ← / → | 前後フレームへ移動（自動保存） |
+| `[` / `]` | ブラシサイズ変更 |
+| `Ctrl+Z` | 元に戻す |
+| `S` | 手動保存 |
 
 ---
 
