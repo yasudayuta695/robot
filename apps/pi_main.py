@@ -21,6 +21,7 @@ from pid_learned_controller import LearnedPIDONNXController
 CAMERA_PORT = 5556
 LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
+CALIB_PORT = 5558
 JPEG_QUALITY_REMOTE = 70
 
 # Command sign correction in remote mode.
@@ -134,6 +135,23 @@ class PiRuntimeConfig:
     pid_steer_rate_limit: float = 0.18
     motor_left_sign: int = -1
     motor_right_sign: int = 1
+
+
+class FrameBuffer:
+    """最新フレームのみ保持するスレッドセーフバッファ（ZMQ CONFLATE と同等）。
+    カメラスレッドが書き込み、検出スレッドが読み出す。"""
+
+    def __init__(self) -> None:
+        self._frame: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
+
+    def put(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+
+    def get(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._frame
 
 
 def _parse_bool(text: str) -> Optional[bool]:
@@ -327,27 +345,6 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
     camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
 
-    last_control_ts = time.perf_counter()
-    last_line_ts = 0.0
-    last_log_ts = 0.0
-    cached_features = line_detector.get_latest_line_features()
-    next_frame_ts = time.perf_counter()
-
-    print("[pid] Initializing camera...")
-    picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
-    picam2.configure(cam_conf)
-    picam2.start()
-    picam2.set_controls(
-        {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": int(args.exposure_time),
-            "AnalogueGain": float(args.analogue_gain),
-        }
-    )
-
-    print("[pid] Started.")
     print(f"[pid] gains: Kp={kp:.4f} Ki={ki:.4f} Kd={kd:.4f}")
     print(
         "[pid] intervals: line={}ms control={}ms camera_fps={}".format(
@@ -357,21 +354,70 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
         )
     )
 
+    stop_event = threading.Event()
+    frame_buf = FrameBuffer()
+
+    def _camera_loop() -> None:
+        print("[pid] Initializing camera...")
+        picam2 = Picamera2()
+        cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+        picam2.configure(cam_conf)
+        picam2.start()
+        picam2.set_controls(
+            {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": int(args.exposure_time),
+                "AnalogueGain": float(args.analogue_gain),
+            }
+        )
+        print("[pid] Camera started.")
+        next_frame_ts = time.perf_counter()
+        try:
+            while not stop_event.is_set():
+                frame_rgb = picam2.capture_array()
+                frame_buf.put(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                if camera_sleep_sec > 0.0:
+                    next_frame_ts += camera_sleep_sec
+                    wait = next_frame_ts - time.perf_counter()
+                    if wait > 0.0:
+                        time.sleep(wait)
+                    else:
+                        next_frame_ts = time.perf_counter()
+        finally:
+            picam2.stop()
+
+    def _detection_loop() -> None:
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            frame = frame_buf.get()
+            if frame is not None:
+                line_detector.find_line(frame)
+            elapsed = time.perf_counter() - t0
+            remaining = line_interval_sec - elapsed
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+    cam_thread = threading.Thread(target=_camera_loop, daemon=True)
+    det_thread = threading.Thread(target=_detection_loop, daemon=True)
+    cam_thread.start()
+    det_thread.start()
+
+    last_control_ts = time.perf_counter()
+    last_log_ts = 0.0
+    cmd_left = 0
+    cmd_right = 0
+    error: Optional[float] = None
+
+    print("[pid] Started.")
     try:
         while True:
             now = time.perf_counter()
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            if (now - last_line_ts) >= line_interval_sec:
-                line_detector.find_line(frame_bgr)
-                cached_features = line_detector.get_latest_line_features()
-                last_line_ts = now
-
             if (now - last_control_ts) >= control_interval_sec:
                 dt = now - last_control_ts
                 last_control_ts = now
 
+                cached_features = line_detector.get_latest_line_features()
                 error = _extract_pid_error(cached_features)
                 if error is None and stop_on_no_line:
                     pid.reset()
@@ -395,18 +441,14 @@ def run_pid_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> 
                     print(f"[pid] err={e_disp} cmd=({cmd_left},{cmd_right})")
                     last_log_ts = now
 
-            if camera_sleep_sec > 0.0:
-                next_frame_ts += camera_sleep_sec
-                wait_sec = next_frame_ts - time.perf_counter()
-                if wait_sec > 0.0:
-                    time.sleep(wait_sec)
-                else:
-                    next_frame_ts = time.perf_counter()
+            time.sleep(0.005)
     except KeyboardInterrupt:
         print("Stopping pid mode...")
     finally:
+        stop_event.set()
+        cam_thread.join(timeout=2.0)
+        det_thread.join(timeout=2.0)
         stop_all_motors(pwm_a, pwm_b)
-        picam2.stop()
 
 
 def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_path: str) -> None:
@@ -446,10 +488,8 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
         picam2.start()
         picam2.set_controls(
             {
-                "AeEnable": False,
-                "AwbEnable": False,
-                "ExposureTime": 7000,
-                "AnalogueGain": 1.0,
+                "AeEnable": True,
+                "AwbEnable": True,
             }
         )
 
@@ -492,8 +532,41 @@ def run_remote_mode(pwm_a: GPIO.PWM, pwm_b: GPIO.PWM, camera_fps: float, config_
             feature_sock.close()
             ctx.term()
 
+    def calib_receive_thread() -> None:
+        nonlocal running
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.PULL)
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        try:
+            sock.bind(f"tcp://*:{CALIB_PORT}")
+        except zmq.ZMQError as e:
+            print(f"[remote] Calibration socket bind failed (port={CALIB_PORT}): {e}")
+            ctx.term()
+            return
+        print("[remote] Calibration receive thread started.")
+        try:
+            while running:
+                try:
+                    msg = sock.recv_json()
+                    w_norm = msg.get("calib_width_norm")
+                    if w_norm is None:
+                        line_detector.clear_calibrated_width()
+                        print("[remote] Calibration cleared.")
+                    else:
+                        line_detector.set_calibrated_width_norm(float(w_norm))
+                        print(f"[remote] Calibration set: {w_norm:.4f}")
+                except zmq.ZMQError:
+                    pass
+        except Exception as e:
+            print(f"[remote] Calibration thread error: {e}")
+        finally:
+            sock.close()
+            ctx.term()
+
     cam_thread = threading.Thread(target=camera_thread, daemon=True)
     cam_thread.start()
+    calib_thread = threading.Thread(target=calib_receive_thread, daemon=True)
+    calib_thread.start()
 
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
@@ -561,50 +634,74 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
     camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
 
-    model_left_speed = 0
-    model_right_speed = 0
-    last_control_ts = 0.0
-    last_line_ts = 0.0
-    cached_features = line_detector.get_latest_line_features()
-    next_frame_ts = time.perf_counter()
-
-    print("[local_ai] Initializing camera...")
-    picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
-    picam2.configure(cam_conf)
-    picam2.start()
-    picam2.set_controls(
-        {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": int(args.exposure_time),
-            "AnalogueGain": float(args.analogue_gain),
-        }
-    )
-
-    print("[local_ai] Started.")
-    print(f"ONNX={onnx_path}")
+    print(f"[local_ai] ONNX={onnx_path}")
     print(
-        "intervals: line={}ms control={}ms camera_fps={}".format(
+        "[local_ai] intervals: line={}ms control={}ms camera_fps={}".format(
             int(runtime_cfg.line_process_interval_ms),
             int(runtime_cfg.ai_control_interval_ms),
             float(args.camera_fps),
         )
     )
 
+    stop_event = threading.Event()
+    frame_buf = FrameBuffer()
+
+    def _camera_loop() -> None:
+        print("[local_ai] Initializing camera...")
+        picam2 = Picamera2()
+        cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+        picam2.configure(cam_conf)
+        picam2.start()
+        picam2.set_controls(
+            {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": int(args.exposure_time),
+                "AnalogueGain": float(args.analogue_gain),
+            }
+        )
+        print("[local_ai] Camera started.")
+        next_frame_ts = time.perf_counter()
+        try:
+            while not stop_event.is_set():
+                frame_rgb = picam2.capture_array()
+                frame_buf.put(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                if camera_sleep_sec > 0.0:
+                    next_frame_ts += camera_sleep_sec
+                    wait = next_frame_ts - time.perf_counter()
+                    if wait > 0.0:
+                        time.sleep(wait)
+                    else:
+                        next_frame_ts = time.perf_counter()
+        finally:
+            picam2.stop()
+
+    def _detection_loop() -> None:
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            frame = frame_buf.get()
+            if frame is not None:
+                line_detector.find_line(frame)
+            elapsed = time.perf_counter() - t0
+            remaining = line_interval_sec - elapsed
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+    cam_thread = threading.Thread(target=_camera_loop, daemon=True)
+    det_thread = threading.Thread(target=_detection_loop, daemon=True)
+    cam_thread.start()
+    det_thread.start()
+
+    model_left_speed = 0
+    model_right_speed = 0
+    last_control_ts = time.perf_counter()
+
+    print("[local_ai] Started.")
     try:
         while True:
             now = time.perf_counter()
-
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            if (now - last_line_ts) >= line_interval_sec:
-                line_detector.find_line(frame_bgr)
-                cached_features = line_detector.get_latest_line_features()
-                last_line_ts = now
-
             if (now - last_control_ts) >= control_interval_sec:
+                cached_features = line_detector.get_latest_line_features()
                 left_speed, right_speed = ai_controller.predict_motor_speed(
                     line_features=cached_features,
                     current_left_speed=model_left_speed,
@@ -622,18 +719,14 @@ def run_local_ai_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM
                 set_right_motor(hw_right_speed, pwm_a)
                 last_control_ts = now
 
-            if camera_sleep_sec > 0.0:
-                next_frame_ts += camera_sleep_sec
-                wait_sec = next_frame_ts - time.perf_counter()
-                if wait_sec > 0.0:
-                    time.sleep(wait_sec)
-                else:
-                    next_frame_ts = time.perf_counter()
+            time.sleep(0.005)
     except KeyboardInterrupt:
         print("Stopping local AI mode...")
     finally:
+        stop_event.set()
+        cam_thread.join(timeout=2.0)
+        det_thread.join(timeout=2.0)
         stop_all_motors(pwm_a, pwm_b)
-        picam2.stop()
 
 
 def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.PWM) -> None:
@@ -678,44 +771,68 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
     line_interval_sec = max(0.02, float(runtime_cfg.line_process_interval_ms) / 1000.0)
     camera_sleep_sec = max(0.0, 1.0 / max(1e-6, float(args.camera_fps)))
 
-    model_left_speed = 0
-    model_right_speed = 0
-    last_control_ts = 0.0
-    last_line_ts = 0.0
-    last_log_ts = 0.0
-    cached_features = line_detector.get_latest_line_features()
-    next_frame_ts = time.perf_counter()
-
-    print("[pid_learned] Initializing camera...")
-    picam2 = Picamera2()
-    cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
-    picam2.configure(cam_conf)
-    picam2.start()
-    picam2.set_controls(
-        {
-            "AeEnable": False,
-            "AwbEnable": False,
-            "ExposureTime": int(args.exposure_time),
-            "AnalogueGain": float(args.analogue_gain),
-        }
-    )
-
-    print("[pid_learned] Started.")
     print(f"[pid_learned] ONNX={onnx_path}")
 
+    stop_event = threading.Event()
+    frame_buf = FrameBuffer()
+
+    def _camera_loop() -> None:
+        print("[pid_learned] Initializing camera...")
+        picam2 = Picamera2()
+        cam_conf = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
+        picam2.configure(cam_conf)
+        picam2.start()
+        picam2.set_controls(
+            {
+                "AeEnable": False,
+                "AwbEnable": False,
+                "ExposureTime": int(args.exposure_time),
+                "AnalogueGain": float(args.analogue_gain),
+            }
+        )
+        print("[pid_learned] Camera started.")
+        next_frame_ts = time.perf_counter()
+        try:
+            while not stop_event.is_set():
+                frame_rgb = picam2.capture_array()
+                frame_buf.put(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                if camera_sleep_sec > 0.0:
+                    next_frame_ts += camera_sleep_sec
+                    wait = next_frame_ts - time.perf_counter()
+                    if wait > 0.0:
+                        time.sleep(wait)
+                    else:
+                        next_frame_ts = time.perf_counter()
+        finally:
+            picam2.stop()
+
+    def _detection_loop() -> None:
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            frame = frame_buf.get()
+            if frame is not None:
+                line_detector.find_line(frame)
+            elapsed = time.perf_counter() - t0
+            remaining = line_interval_sec - elapsed
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+    cam_thread = threading.Thread(target=_camera_loop, daemon=True)
+    det_thread = threading.Thread(target=_detection_loop, daemon=True)
+    cam_thread.start()
+    det_thread.start()
+
+    model_left_speed = 0
+    model_right_speed = 0
+    last_control_ts = time.perf_counter()
+    last_log_ts = 0.0
+
+    print("[pid_learned] Started.")
     try:
         while True:
             now = time.perf_counter()
-
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            if (now - last_line_ts) >= line_interval_sec:
-                line_detector.find_line(frame_bgr)
-                cached_features = line_detector.get_latest_line_features()
-                last_line_ts = now
-
             if (now - last_control_ts) >= control_interval_sec:
+                cached_features = line_detector.get_latest_line_features()
                 left_speed, right_speed = controller.predict_motor_speed(
                     line_features=cached_features,
                     current_left_speed=model_left_speed,
@@ -741,18 +858,14 @@ def run_pid_learned_mode(args: argparse.Namespace, pwm_a: GPIO.PWM, pwm_b: GPIO.
                     )
                     last_log_ts = now
 
-            if camera_sleep_sec > 0.0:
-                next_frame_ts += camera_sleep_sec
-                wait_sec = next_frame_ts - time.perf_counter()
-                if wait_sec > 0.0:
-                    time.sleep(wait_sec)
-                else:
-                    next_frame_ts = time.perf_counter()
+            time.sleep(0.005)
     except KeyboardInterrupt:
         print("Stopping pid_learned mode...")
     finally:
+        stop_event.set()
+        cam_thread.join(timeout=2.0)
+        det_thread.join(timeout=2.0)
         stop_all_motors(pwm_a, pwm_b)
-        picam2.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -116,8 +116,19 @@ class CameraReceiver:
         self._prev_accepted_offsets: Dict[str, Optional[float]] = {"top": None, "mid": None, "bottom": None}
         self._line_detection_profile_name = DEFAULT_LINE_DETECTION_PROFILE
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
+        self._calibrated_width_norm: Optional[float] = None
+        self._last_width_med_norm: float = 0.0
+        self._show_binary_mask: bool = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def set_show_binary_mask(self, enabled: bool) -> None:
+        with self._lock:
+            self._show_binary_mask = bool(enabled)
+
+    def is_show_binary_mask(self) -> bool:
+        with self._lock:
+            return self._show_binary_mask
 
     def is_remote_line_feature_mode(self) -> bool:
         return self.line_feature_port is not None and int(self.line_feature_port) > 0
@@ -223,6 +234,41 @@ class CameraReceiver:
             # 急なジャンプを抑えるため、検出中心を緩やかに追従
             self._prev_center_x = 0.82 * float(self._prev_center_x) + 0.18 * float(center_x)
         self._consecutive_misses = 0
+
+    def calibrate_straight_width(self) -> Optional[float]:
+        """直前に検出した幅中央値をキャリブレーション値として保存する。
+        remote mode では最新フィーチャの各ゾーン幅をフォールバックとして使用する。
+        """
+        with self._lock:
+            w = float(self._last_width_med_norm)
+            if w <= 0.0:
+                # remote mode フォールバック: 最新フィーチャから幅を推定
+                feats = self._latest_line_features
+                widths = [
+                    float(feats.get(f"line_width_{z}", 0.0))
+                    for z in ("top", "mid", "bottom")
+                    if float(feats.get(f"line_detect_{z}", 0.0)) > 0.0
+                ]
+                if widths:
+                    w = float(np.median(widths))
+        if w <= 0.0:
+            return None
+        with self._lock:
+            self._calibrated_width_norm = w
+        return w
+
+    def get_calibrated_width_norm(self) -> Optional[float]:
+        with self._lock:
+            return self._calibrated_width_norm
+
+    def set_calibrated_width_norm(self, value: Optional[float]) -> None:
+        """外部から直接キャリブレーション値を設定する（remote mode でPC→Pi 送信用）。"""
+        with self._lock:
+            self._calibrated_width_norm = float(value) if value is not None else None
+
+    def clear_calibrated_width(self) -> None:
+        with self._lock:
+            self._calibrated_width_norm = None
 
     def _default_line_features(self) -> Dict[str, float]:
         return {
@@ -604,7 +650,7 @@ class CameraReceiver:
             mask = mask & (corridor_mask.view(np.uint8) * 255)
 
             # corridor が厳しすぎて消失する場合は、当該フレームのみ corridor を外す。
-            if cv2.countNonZero(mask) < int(max(24, mask.size * 0.0015)):
+            if cv2.countNonZero(mask) < int(max(24, mask.size * 0.004)):
                 mask = global_mask.copy()
 
         kernel_far = np.ones((2, 2), np.uint8)
@@ -961,7 +1007,8 @@ class CameraReceiver:
 
     def find_line(self, img: np.ndarray) -> Optional[np.ndarray]:
         debug_overlay_enabled = self.is_debug_overlay_enabled()
-        vis = img.copy() if debug_overlay_enabled else img
+        show_binary = self.is_show_binary_mask()
+        vis = img.copy() if (debug_overlay_enabled or show_binary) else img
         h, w = vis.shape[:2]
         features = self._default_line_features()
 
@@ -973,6 +1020,12 @@ class CameraReceiver:
             frame_width=w,
         )
 
+        if show_binary:
+            # マスクを BGR に変換して vis を差し替え（検出オーバーレイはこの上に描く）
+            mask_full = np.zeros((h, w), dtype=np.uint8)
+            mask_full[roi_top:, :] = mask
+            vis = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
+
         # 3分割ガイド（遠/中/近）: ROI内を均等3分割
         _roi_available = h - roi_top
         y1 = roi_top + _roi_available // 3
@@ -983,6 +1036,12 @@ class CameraReceiver:
             cv2.putText(vis, "Far", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
             cv2.putText(vis, "Mid", (8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
             cv2.putText(vis, "Near", (8, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+            with self._lock:
+                calib_done = self._calibrated_width_norm is not None
+            if not calib_done:
+                cx_guide = w // 2
+                cv2.line(vis, (cx_guide, roi_top), (cx_guide, h - 1), (0, 200, 255), 1)
+                cv2.putText(vis, "CALIB?", (cx_guide + 4, roi_top + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1, cv2.LINE_AA)
             cv2.putText(
                 vis,
                 f"{intensity_mode} th_far={far_threshold} th_near={near_threshold}",
@@ -1195,6 +1254,10 @@ class CameraReceiver:
         if valid_centers.size >= 3:
             center_step_p90 = float(np.percentile(np.abs(np.diff(valid_centers)), 90))
 
+        # キャリブレーション用に幅を保存（too_wide で棄却される前でも記録）
+        with self._lock:
+            self._last_width_med_norm = width_med / max(1.0, float(w))
+
         post_reject_reason = evaluate_post_track_reject_reason(
             width_med=width_med,
             width_p90=width_p90,
@@ -1206,6 +1269,16 @@ class CameraReceiver:
             span_ratio_rows=span_ratio_rows,
             cfg=cfg.post_track,
         )
+        if post_reject_reason == "too_wide":
+            with self._lock:
+                calib_w_norm = self._calibrated_width_norm
+            if calib_w_norm is not None and calib_w_norm > 0.0:
+                # valid_centers は上→下でソート済み → 端点差分でカーブ度を推定
+                curve_disp = abs(float(valid_centers[-1]) - float(valid_centers[0]))
+                curve_ratio = curve_disp / max(1.0, float(w))
+                width_scale = 1.0 + 2.5 * curve_ratio
+                if width_med <= calib_w_norm * width_scale * float(w):
+                    post_reject_reason = None
         if post_reject_reason is None and using_soft_recover:
             soft_jitter_limit = max(14.0, 0.09 * float(w))
             if center_step_p90 > soft_jitter_limit:

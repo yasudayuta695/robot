@@ -6,6 +6,7 @@ import time
 import datetime
 import cv2
 import numpy as np
+import zmq
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -29,6 +30,7 @@ DEADZONE = 35
 CAMERA_PORT = 5556
 LINE_FEATURE_PORT = 5557
 MOTOR_PORT = 5555
+CALIB_PORT = 5558
 LEFT_SIGN = 1
 RIGHT_SIGN = 1
 PIVOT_Y_THRESHOLD = 0.15
@@ -64,13 +66,17 @@ class _LineDetectionWorker:
         self._thread: Optional[threading.Thread] = None
 
     @staticmethod
-    def _draw_remote_feature_overlay(frame: np.ndarray, features: Dict[str, float]) -> np.ndarray:
+    def _draw_remote_feature_overlay(frame: np.ndarray, features: Dict[str, float], calib_done: bool = True) -> np.ndarray:
         vis = frame.copy()
         h, w = vis.shape[:2]
         roi_top = int(h * 0.25)
         roi_available = h - roi_top
         y1 = roi_top + (roi_available // 3)
         y2 = roi_top + ((2 * roi_available) // 3)
+        if not calib_done:
+            cx_guide = w // 2
+            cv2.line(vis, (cx_guide, roi_top), (cx_guide, h - 1), (0, 200, 255), 1)
+            cv2.putText(vis, "CALIB?", (cx_guide + 4, roi_top + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1, cv2.LINE_AA)
         zone_rows = {
             "top": (roi_top + y1) // 2,
             "mid": (y1 + y2) // 2,
@@ -143,24 +149,34 @@ class _LineDetectionWorker:
         next_tick = time.perf_counter()
         while self._running:
             frame = self._camera_receiver.get_latest_frame()
-            if self._camera_receiver.is_remote_line_feature_mode():
-                features = self._camera_receiver.get_latest_line_features()
+            show_binary = self._camera_receiver.is_show_binary_mask()
+
+            use_pi = False
+            if self._camera_receiver.is_remote_line_feature_mode() and not show_binary:
                 remote_age = self._camera_receiver.get_remote_feature_age_sec()
                 has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
                 if has_recent_remote:
-                    vis = self._draw_remote_feature_overlay(frame, features)
-                    self._remote_stale_logged = False
-                else:
-                    vis = self._camera_receiver.find_line(frame)
-                    features = self._camera_receiver.get_latest_line_features()
-                    if not self._remote_stale_logged:
-                        logging.getLogger("pi_pc_app").warning(
-                            "Remote line features stale/missing. Falling back to local find_line()."
-                        )
-                        self._remote_stale_logged = True
+                    pi_features = self._camera_receiver.get_latest_line_features()
+                    pi_detected = any(
+                        pi_features.get(f"line_detect_{z}", 0.0) > 0.0
+                        for z in ("top", "mid", "bottom")
+                    )
+                    if pi_detected:
+                        use_pi = True
+
+            if use_pi:
+                # Pi 検出成功 → 生フレーム処理の結果を採用
+                calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+                vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
+                features = pi_features
+                self._remote_stale_logged = False
             else:
+                # Pi 検出失敗 or 二値化表示 → PC 側でキャリブ込みの find_line() を実行
+                if not show_binary and not self._remote_stale_logged:
+                    logging.getLogger("pi_pc_app").debug("Pi detection failed. Running local find_line().")
                 vis = self._camera_receiver.find_line(frame)
                 features = self._camera_receiver.get_latest_line_features()
+
             with self._lock:
                 self._latest_vis = vis
                 self._latest_features = features
@@ -237,6 +253,15 @@ class UnifiedApp:
         self.camera_receiver.start()
 
         self.motor_client = MotorClient(PI_IP, MOTOR_PORT, self.logger)
+        self._calib_zmq_ctx = zmq.Context()
+        self._calib_sock = self._calib_zmq_ctx.socket(zmq.PUSH)
+        self._calib_sock.setsockopt(zmq.SNDHWM, 4)
+        self._calib_sock.connect(f"tcp://{PI_IP}:{CALIB_PORT}")
+        self._calib_resend_stop = threading.Event()
+        self._calib_resend_thread = threading.Thread(
+            target=self._calib_resend_loop, daemon=True
+        )
+        self._calib_resend_thread.start()
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
         self.ai_controller = LearnedPIDONNXController(
             history=10,
@@ -425,6 +450,15 @@ class UnifiedApp:
         )
         self.debug_overlay_check.pack(side=tk.LEFT, padx=(12, 0))
 
+        self.show_binary_var = tk.BooleanVar(value=False)
+        self.show_binary_check = tk.Checkbutton(
+            self.threshold_frame,
+            text="二値化表示",
+            variable=self.show_binary_var,
+            command=self.on_toggle_show_binary,
+        )
+        self.show_binary_check.pack(side=tk.LEFT, padx=(12, 0))
+
         self.offset_filter_frame = tk.Frame(self.main_frame)
         self.offset_filter_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
 
@@ -449,6 +483,30 @@ class UnifiedApp:
         )
         self.offset_jump_threshold_label.pack(side=tk.LEFT)
         tk.Label(self.offset_filter_frame, text="(1.00=無効)", fg="gray50").pack(side=tk.LEFT, padx=(4, 0))
+
+        self.calib_width_frame = tk.Frame(self.main_frame)
+        self.calib_width_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
+        tk.Label(self.calib_width_frame, text="幅キャリブ:").pack(side=tk.LEFT)
+        self.calib_width_btn = tk.Button(
+            self.calib_width_frame,
+            text="直線幅をキャリブ",
+            command=self.on_calibrate_width,
+        )
+        self.calib_width_btn.pack(side=tk.LEFT, padx=(4, 8))
+        self.calib_width_label = tk.Label(
+            self.calib_width_frame,
+            text="未設定",
+            width=14,
+            fg="gray50",
+        )
+        self.calib_width_label.pack(side=tk.LEFT)
+        self.calib_width_clear_btn = tk.Button(
+            self.calib_width_frame,
+            text="クリア",
+            command=self.on_clear_calibrated_width,
+        )
+        self.calib_width_clear_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self.dpad_sensitivity_frame = tk.Frame(self.main_frame)
         self.dpad_sensitivity_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
@@ -701,6 +759,10 @@ class UnifiedApp:
         else:
             self.logger.info("黒ライン閾値の自動補正: OFF")
 
+    def on_toggle_show_binary(self) -> None:
+        enabled = bool(self.show_binary_var.get())
+        self.camera_receiver.set_show_binary_mask(enabled)
+
     def on_toggle_debug_overlay(self) -> None:
         enabled = self.camera_receiver.set_debug_overlay_enabled(bool(self.debug_overlay_var.get()))
         self.debug_overlay_var.set(enabled)
@@ -708,6 +770,44 @@ class UnifiedApp:
             self.logger.info("Debug Overlay: ON")
         else:
             self.logger.info("Debug Overlay: OFF")
+
+    def _calib_resend_loop(self) -> None:
+        """キャリブ値を 1 秒間隔で最大 3 回再送して接続タイミングのずれを吸収する。"""
+        for _ in range(3):
+            if self._calib_resend_stop.wait(timeout=1.0):
+                break
+            w_norm = self.camera_receiver.get_calibrated_width_norm()
+            if w_norm is None:
+                break
+            try:
+                self._calib_sock.send_json(
+                    {"calib_width_norm": w_norm},
+                    flags=zmq.NOBLOCK,
+                )
+            except zmq.ZMQError:
+                pass
+
+    def on_calibrate_width(self) -> None:
+        w_norm = self.camera_receiver.calibrate_straight_width()
+        if w_norm is None:
+            self.calib_width_label.config(text="検出なし", fg="red")
+            self.logger.warning("幅キャリブレーション失敗: 直線検出データなし")
+        else:
+            self.calib_width_label.config(text=f"{w_norm:.3f} (norm)", fg="green")
+            self.logger.info("幅キャリブレーション設定: %.3f (norm)", w_norm)
+            try:
+                self._calib_sock.send_json({"calib_width_norm": w_norm}, flags=zmq.NOBLOCK)
+            except zmq.ZMQError as exc:
+                self.logger.warning("Pi へのキャリブ送信失敗: %s", exc)
+
+    def on_clear_calibrated_width(self) -> None:
+        self.camera_receiver.clear_calibrated_width()
+        self.calib_width_label.config(text="未設定", fg="gray50")
+        self.logger.info("幅キャリブレーションをクリア")
+        try:
+            self._calib_sock.send_json({"calib_width_norm": None}, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as exc:
+            self.logger.warning("Pi へのキャリブクリア送信失敗: %s", exc)
 
     def on_dpad_drive_sensitivity_change(self, _value: str) -> None:
         self.dpad_drive_scale_value_label.config(text=f"{self.get_dpad_drive_scale():.2f}")
@@ -1030,11 +1130,12 @@ class UnifiedApp:
         self.camera_label.config(image=tk_image)
         self.camera_label.image = tk_image
 
-        self._append_coordinate_stream(
-            line_features=line_features,
-            frame_w=display_frame.shape[1],
-            frame_h=display_frame.shape[0],
-        )
+        if self.recorder.state == RecorderState.RECORDING:
+            self._append_coordinate_stream(
+                line_features=line_features,
+                frame_w=display_frame.shape[1],
+                frame_h=display_frame.shape[0],
+            )
 
         self.recorder.record_frame(
             image_rgb=frame,
@@ -1120,6 +1221,10 @@ class UnifiedApp:
         self.recorder.close_and_discard_on_exit()
         self.camera_receiver.stop()
         self.motor_client.close()
+        self._calib_resend_stop.set()
+        self._calib_resend_thread.join(timeout=4.0)
+        self._calib_sock.close()
+        self._calib_zmq_ctx.term()
         self.root.unbind_all("<KeyPress>")
         self.root.unbind_all("<KeyRelease>")
         self.root.destroy()
