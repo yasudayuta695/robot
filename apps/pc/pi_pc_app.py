@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import threading
 import tkinter as tk
 import time
@@ -9,6 +10,10 @@ import numpy as np
 import zmq
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Set, Tuple
+
+_SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared")
+if _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
 
 from PIL import Image, ImageTk
 

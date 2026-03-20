@@ -1,10 +1,15 @@
 import argparse
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+_SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared")
+if _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
 
 import cv2
 import numpy as np
@@ -897,9 +902,9 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
 
     if not args.config_path:
-        args.config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "comfig.txt"))
+        args.config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "comfig.txt"))
     if not args.onnx_path:
-        args.onnx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "robot_MLP", "model.onnx"))
+        args.onnx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "robot_MLP", "model.onnx"))
 
     print(f"[boot] mode={args.mode}")
     print(f"[boot] config={args.config_path}")
