@@ -133,6 +133,13 @@ def main() -> None:
         color_space=args.color_space,
     )
 
+    # パスが存在しない場合、apps/ 以下を自動で試す
+    if not os.path.isdir(args.target):
+        alt = os.path.join(_ROOT, "apps", args.target)
+        if os.path.isdir(alt):
+            print(f"パスを自動補完: {args.target} → {alt}")
+            args.target = alt
+
     if args.all:
         sessions = find_sessions(args.target)
         if not sessions:
