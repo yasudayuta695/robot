@@ -16,6 +16,8 @@ generate_masks.py で自動生成したマスクを下書きとして読み込�
   左ドラッグ       : コース領域を塗る
   右ドラッグ       : マスクを消す
   ← / →          : 前後のフレームへ移動（自動保存）
+  ホイール         : ブラシサイズを変更
+  中クリック       : 元に戻す（Undo）
   S               : 現在のマスクを保存
   P               : 塗るモードに切り替え
   E               : 消すモードに切り替え
@@ -29,17 +31,50 @@ import os
 import sys
 from typing import Optional
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import cv2
 import numpy as np
 
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import messagebox, ttk
     from PIL import Image, ImageTk
 except ImportError as e:
     print(f"依存ライブラリが不足しています: {e}")
     print("pip install pillow")
     sys.exit(1)
+
+
+def _setup_japanese_font(root: "tk.Tk") -> None:
+    """日本語表示可能なフォントを検出してデフォルトに設定する。"""
+    candidates = [
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "IPAGothic",
+        "IPAPGothic",
+        "VL Gothic",
+        "TakaoGothic",
+        "Takao",
+        "Meiryo",
+        "MS Gothic",
+    ]
+    available = set(tkfont.families(root))
+    for name in candidates:
+        if name in available:
+            # tkinter の全名前付きフォントを変更する
+            for font_name in (
+                "TkDefaultFont", "TkTextFont", "TkMenuFont",
+                "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                "TkIconFont", "TkTooltipFont",
+            ):
+                try:
+                    tkfont.nametofont(font_name).configure(family=name, size=10)
+                except Exception:
+                    pass
+            return
+    # 見つからなければ何もしない（デフォルトのまま）
 
 # 表示スケール: 320×240 → 960×720
 DISPLAY_SCALE = 3
@@ -78,6 +113,10 @@ class AnnotatorApp:
         self.last_xy: Optional[tuple[int, int]] = None
         self._undo_stack: list[np.ndarray] = []
 
+        # ブラシカーソル
+        self._cursor_id: Optional[int] = None
+        self._cursor_xy: Optional[tuple[int, int]] = None
+
         self._build_ui()
         self._load_frame(0)
 
@@ -99,22 +138,27 @@ class AnnotatorApp:
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
-        # モード切り替え
+        # モード切り替え（大きなトグルボタン）
         self.mode_var = tk.StringVar(value="paint")
-        tk.Radiobutton(
-            top, text="塗る (P)", variable=self.mode_var,
-            value="paint", command=self._on_mode_change,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            top, text="消す (E)", variable=self.mode_var,
-            value="erase", command=self._on_mode_change,
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_paint = tk.Button(
+            top, text="✏ 塗る (P)", width=10, relief=tk.SUNKEN,
+            bg="#2196F3", fg="white", font=("", 10, "bold"),
+            command=lambda: self._set_mode("paint"),
+        )
+        self._btn_paint.pack(side=tk.LEFT, padx=2)
+        self._btn_erase = tk.Button(
+            top, text="✕ 消す (E)", width=10, relief=tk.RAISED,
+            bg="#cccccc", fg="black", font=("", 10, "bold"),
+            command=lambda: self._set_mode("erase"),
+        )
+        self._btn_erase.pack(side=tk.LEFT, padx=(0, 4))
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         # ブラシサイズ
         tk.Label(top, text="ブラシ:").pack(side=tk.LEFT)
         self.brush_var = tk.IntVar(value=8)
+        self.brush_var.trace_add("write", lambda *_: self._redraw_cursor())
         tk.Scale(
             top, variable=self.brush_var,
             from_=1, to=40, orient=tk.HORIZONTAL,
@@ -150,16 +194,29 @@ class AnnotatorApp:
         # --- キャンバス (サイズは最初のフレーム読み込み時に確定) ---
         self.canvas = tk.Canvas(
             self.root, width=320 * DISPLAY_SCALE, height=240 * DISPLAY_SCALE,
-            cursor="crosshair", bg="black",
+            cursor="none", bg="black",
         )
         self.canvas.pack(side=tk.TOP, padx=6, pady=4)
 
+        # 描画イベント
         self.canvas.bind("<ButtonPress-1>", self._on_press_paint)
         self.canvas.bind("<B1-Motion>", self._on_drag_paint)
         self.canvas.bind("<ButtonPress-3>", self._on_press_erase)
         self.canvas.bind("<B3-Motion>", self._on_drag_erase)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<ButtonRelease-3>", self._on_release)
+
+        # カーソル追跡
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<Leave>", self._on_canvas_leave)
+
+        # マウスホイール（ブラシサイズ）
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)        # Windows / macOS
+        self.canvas.bind("<Button-4>", lambda e: self._wheel_brush(1))   # Linux scroll up
+        self.canvas.bind("<Button-5>", lambda e: self._wheel_brush(-1))  # Linux scroll down
+
+        # 中クリック → Undo
+        self.canvas.bind("<ButtonPress-2>", lambda _: self._undo())
 
         # --- ステータスバー ---
         self.status_var = tk.StringVar(value="")
@@ -171,6 +228,10 @@ class AnnotatorApp:
         # --- キーバインド ---
         self.root.bind("<Left>", lambda _: self._prev_frame())
         self.root.bind("<Right>", lambda _: self._next_frame())
+        self.root.bind("<KP_Left>", lambda _: self._prev_frame())
+        self.root.bind("<KP_Right>", lambda _: self._next_frame())
+        self.root.bind("<KP_Up>", lambda _: self._adjust_brush(2))
+        self.root.bind("<KP_Down>", lambda _: self._adjust_brush(-2))
         self.root.bind("s", lambda _: self._save_mask())
         self.root.bind("p", lambda _: self._set_mode("paint"))
         self.root.bind("e", lambda _: self._set_mode("erase"))
@@ -219,19 +280,84 @@ class AnnotatorApp:
         if self.current_image is None or self.current_mask is None:
             return
         alpha = float(self.opacity_var.get())
-        base = self.current_image.copy()
-        overlay = base.copy()
-        overlay[self.current_mask > 0] = MASK_COLOR_BGR
-        blended = cv2.addWeighted(overlay, alpha, base, 1.0 - alpha, 0)
 
-        h, w = blended.shape[:2]
+        # 元画像をフル輝度で表示し、マスク領域だけ半透明の色を重ねる
+        base_rgb = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB)
+        h, w = base_rgb.shape[:2]
+
+        # PIL で alpha composite（元画像 100% + 色レイヤー alpha%）
+        base_pil = Image.fromarray(base_rgb).convert("RGBA")
+        color_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        color_arr = np.zeros((h, w, 4), dtype=np.uint8)
+        color_arr[self.current_mask > 0] = (0, 200, 0, int(alpha * 255))
+        color_layer = Image.fromarray(color_arr, mode="RGBA")
+        blended_pil = Image.alpha_composite(base_pil, color_layer).convert("RGB")
+        blended = np.array(blended_pil)
+
+        blended_bgr = cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
+
+        # マスク境界を白線で描画（輪郭が見やすい）
+        contours, _ = cv2.findContours(
+            self.current_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(blended_bgr, contours, -1, (255, 255, 255), 1)
+
+        # ROI 境界線と上部の無効領域を表示
+        roi_top = int(h * 0.25)
+        # 上部 25% を暗く表示（アノテーション不要領域）
+        blended_bgr[:roi_top] = (blended_bgr[:roi_top] * 0.4).astype(np.uint8)
+        # ROI 境界を赤の点線で描画
+        for x in range(0, w, 8):
+            cv2.line(blended_bgr, (x, roi_top), (min(x + 4, w), roi_top), (0, 0, 220), 1)
+
+        blended = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+
         display = cv2.resize(
             blended, (w * DISPLAY_SCALE, h * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
         )
-        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-        self._tk_img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self._tk_img = ImageTk.PhotoImage(Image.fromarray(display))
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+        self._redraw_cursor()
+
+    # ------------------------------------------------------------------
+    # ブラシカーソル
+    # ------------------------------------------------------------------
+    def _redraw_cursor(self) -> None:
+        """カーソル円を再描画する。"""
+        if self._cursor_id is not None:
+            self.canvas.delete(self._cursor_id)
+            self._cursor_id = None
+        if self._cursor_xy is None:
+            return
+        cx, cy = self._cursor_xy
+        r = max(1, self.brush_var.get()) * DISPLAY_SCALE
+        color = "#00dd00" if self.draw_mode == "paint" else "#ff3333"
+        self._cursor_id = self.canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r,
+            outline=color, width=2, fill="",
+        )
+
+    def _on_canvas_motion(self, event: tk.Event) -> None:
+        self._cursor_xy = (event.x, event.y)
+        self._redraw_cursor()
+
+    def _on_canvas_leave(self, event: tk.Event) -> None:
+        self._cursor_xy = None
+        if self._cursor_id is not None:
+            self.canvas.delete(self._cursor_id)
+            self._cursor_id = None
+
+    # ------------------------------------------------------------------
+    # マウスホイール
+    # ------------------------------------------------------------------
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        # Windows: delta=±120, macOS: delta=±1〜
+        steps = 1 if event.delta > 0 else -1
+        self._adjust_brush(steps * 2)
+
+    def _wheel_brush(self, direction: int) -> None:
+        self._adjust_brush(direction * 2)
 
     # ------------------------------------------------------------------
     # 描画ヘルパー
@@ -273,12 +399,13 @@ class AnnotatorApp:
         self._push_undo()
         self.drawing = True
         self.last_xy = (event.x, event.y)
-        self._apply_brush(event.x, event.y, "paint")
+        self._apply_brush(event.x, event.y, self.draw_mode)
         self._render()
 
     def _on_drag_paint(self, event: tk.Event) -> None:
+        self._cursor_xy = (event.x, event.y)
         if self.drawing and self.last_xy:
-            self._apply_stroke(self.last_xy[0], self.last_xy[1], event.x, event.y, "paint")
+            self._apply_stroke(self.last_xy[0], self.last_xy[1], event.x, event.y, self.draw_mode)
             self._render()
         self.last_xy = (event.x, event.y)
 
@@ -290,6 +417,7 @@ class AnnotatorApp:
         self._render()
 
     def _on_drag_erase(self, event: tk.Event) -> None:
+        self._cursor_xy = (event.x, event.y)
         if self.drawing and self.last_xy:
             self._apply_stroke(self.last_xy[0], self.last_xy[1], event.x, event.y, "erase")
             self._render()
@@ -340,9 +468,16 @@ class AnnotatorApp:
     def _set_mode(self, mode: str) -> None:
         self.draw_mode = mode
         self.mode_var.set(mode)
+        if mode == "paint":
+            self._btn_paint.config(relief=tk.SUNKEN, bg="#2196F3", fg="white")
+            self._btn_erase.config(relief=tk.RAISED, bg="#cccccc", fg="black")
+        else:
+            self._btn_paint.config(relief=tk.RAISED, bg="#cccccc", fg="black")
+            self._btn_erase.config(relief=tk.SUNKEN, bg="#f44336", fg="white")
+        self._redraw_cursor()
 
     def _on_mode_change(self) -> None:
-        self.draw_mode = self.mode_var.get()
+        self._set_mode(self.mode_var.get())
 
     def _adjust_brush(self, delta: int) -> None:
         self.brush_var.set(int(np.clip(self.brush_var.get() + delta, 1, 40)))
@@ -368,11 +503,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # パスが存在しない場合、apps/ 以下を自動で試す
     if not os.path.isdir(args.session_dir):
-        print(f"ディレクトリが存在しません: {args.session_dir}")
-        sys.exit(1)
+        alt = os.path.join(_ROOT, "apps", args.session_dir)
+        if os.path.isdir(alt):
+            print(f"パスを自動補完: {args.session_dir} → {alt}")
+            args.session_dir = alt
+        else:
+            print(f"ディレクトリが存在しません: {args.session_dir}")
+            sys.exit(1)
 
     root = tk.Tk()
+    _setup_japanese_font(root)
     AnnotatorApp(root, args.session_dir)
     root.mainloop()
 

@@ -933,7 +933,7 @@ class UnifiedApp:
         folder_name = self.recorder.get_output_folder_name()
         camera_id = sanitize_for_dirname(self.camera_var.get())
         drive_type = sanitize_for_dirname(self.drive_type_var.get())
-        return os.path.join(self.config.save_base_dir, "dataset", camera_id, drive_type, folder_name)
+        return os.path.join(self.config.save_base_dir, "apps", "dataset", camera_id, drive_type, folder_name)
 
     def commit_data(self) -> None:
         base_dir = self.get_final_base_dir()

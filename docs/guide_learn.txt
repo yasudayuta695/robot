@@ -132,10 +132,10 @@ python apps/pc/pi_pc_app.py
 # → 走り終わったら停止 → データをコミット
 ```
 
-保存先: `dataset/<camera_id>/<drive_type>/<timestamp>/`
+保存先: `apps/dataset/<camera_id>/<drive_type>/<timestamp>/`
 
 ```
-dataset/camera_1/straight/20260316_133810_941565/
+apps/dataset/camera_1/straight/20260316_133810_941565/
   image/          ← Pi カメラの生フレーム（ML 入力に使う）
   mask/           ← アノテーションマスク（generate_masks.py が生成）
   driving_log.csv ← detect/offset/モータ値（制御モデル学習に使う）
@@ -155,19 +155,19 @@ dataset/camera_1/straight/20260316_133810_941565/
 
 ```bash
 # 特定セッション 1 つ
-python tools/generate_masks.py dataset/camera_1/straight/20260316_133810_941565
+python tools/generate_masks.py apps/dataset/camera_1/straight/20260316_133810_941565
 
-# dataset/ 以下の全セッションをまとめて処理
-python tools/generate_masks.py --all dataset/
+# apps/dataset/ 以下の全セッションをまとめて処理
+python tools/generate_masks.py --all apps/dataset/
 
 # 既存マスクを上書きする場合
-python tools/generate_masks.py --all dataset/ --overwrite
+python tools/generate_masks.py --all apps/dataset/ --overwrite
 ```
 
 #### アノテーション GUI コマンド
 
 ```bash
-python tools/annotate_masks.py dataset/camera_1/straight/20260316_133810_941565
+python tools/annotate_masks.py apps/dataset/camera_1/straight/20260316_133810_941565
 ```
 
 | 操作 | 動作 |
