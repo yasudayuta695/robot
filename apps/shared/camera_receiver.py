@@ -235,6 +235,18 @@ class CameraReceiver:
             self._prev_center_x = 0.70 * float(self._prev_center_x) + 0.30 * float(center_x)
         self._consecutive_misses = 0
 
+    def compute_line_mask(self, frame: np.ndarray) -> np.ndarray:
+        """学習データ生成用: フレームからコース領域の二値マスク (0/255) を返す。
+        ROI より上の領域はゼロ、ROI 内はルールベース二値化結果。"""
+        h, w = frame.shape[:2]
+        roi_top = int(h * 0.25)
+        vis = frame.copy()
+        mask, roi_h, _, _, _ = self._build_line_mask(vis, roi_top, w)
+        full_mask = np.zeros((h, w), dtype=np.uint8)
+        if mask is not None and mask.size > 0:
+            full_mask[roi_top:roi_top + roi_h] = mask
+        return full_mask
+
     def calibrate_straight_width(self) -> Optional[float]:
         """直前に検出した幅中央値をキャリブレーション値として保存する。
         remote mode では最新フィーチャの各ゾーン幅をフォールバックとして使用する。
