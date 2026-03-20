@@ -107,7 +107,7 @@ class CameraReceiver:
         self._prev_center_x: Optional[float] = None
         self._consecutive_misses = 0
         self._lost_feature_hold_frames = 8
-        self._offset_jump_threshold: float = 0.28
+        self._offset_jump_threshold: float = 0.40
         self._feature_smoothing_alpha: float = 0.22
         self._offset_deadband: float = 0.02
         self._feature_history_len: int = 5
@@ -232,7 +232,7 @@ class CameraReceiver:
             self._prev_center_x = float(center_x)
         else:
             # 急なジャンプを抑えるため、検出中心を緩やかに追従
-            self._prev_center_x = 0.82 * float(self._prev_center_x) + 0.18 * float(center_x)
+            self._prev_center_x = 0.70 * float(self._prev_center_x) + 0.30 * float(center_x)
         self._consecutive_misses = 0
 
     def calibrate_straight_width(self) -> Optional[float]:
@@ -910,11 +910,14 @@ class CameraReceiver:
         center_ref_default = float(self._prev_center_x) if self._prev_center_x is not None else (frame_w * 0.5)
         min_seg_w = max(4, int(frame_w * 0.015))
         max_seg_w = max(min_seg_w + 2, int(frame_w * 0.55))
+        calib_width_norm = self.get_calibrated_width_norm()
+        # 遠近ゾーンごとの透視投影による幅スケール（near=1.0 基準）
+        _zone_width_scale = {"top": 0.55, "mid": 0.75, "bottom": 1.0}
 
         for name, zone_key, ay_global in zones:
             ay = int(np.clip(ay_global - roi_top, 0, roi_h - 1))
-            by0 = max(0, ay - 6)
-            by1 = min(roi_h, ay + 7)
+            by0 = max(0, ay - 10)
+            by1 = min(roi_h, ay + 11)
             band = gray[by0:by1, :]
             if band.size == 0:
                 continue
@@ -924,7 +927,11 @@ class CameraReceiver:
 
             p20 = float(np.percentile(profile, 20))
             p50 = float(np.percentile(profile, 50))
-            dark_thr = min(p20 + 8.0, p50 - 4.0)
+            # 遠方ゾーン（top）はラインが細く暗さが弱いため閾値を緩める
+            if zone_key == "top":
+                dark_thr = min(p20 + 14.0, p50 - 1.0)
+            else:
+                dark_thr = min(p20 + 8.0, p50 - 4.0)
             dark_mask = profile <= dark_thr
 
             xs = np.flatnonzero(dark_mask)
@@ -946,8 +953,14 @@ class CameraReceiver:
                 if seg_w < min_seg_w or seg_w > max_seg_w:
                     continue
                 cx = 0.5 * float(x0 + x1_)
-                center_ref = float(detected_centers.get("bottom", detected_centers.get("mid", center_ref_default)))
-                cost = abs(cx - center_ref) - (0.10 * float(seg_w))
+                center_ref = center_ref_default
+                cost_weight = max(1.0, 1.5 - 0.15 * min(self._consecutive_misses, 3))
+                cost = abs(cx - center_ref) * cost_weight - (0.10 * float(seg_w))
+                # キャリブ済み幅との乖離ペナルティ（誤検出抑制）
+                if calib_width_norm is not None:
+                    expected_w = calib_width_norm * float(frame_w) * _zone_width_scale.get(zone_key, 1.0)
+                    width_dev = abs(float(seg_w) - expected_w) / max(expected_w, 1.0)
+                    cost += max(0.0, width_dev - 0.5) * 40.0
                 if cost < best_cost:
                     best_cost = cost
                     best_cx = cx
