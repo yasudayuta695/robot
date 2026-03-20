@@ -100,7 +100,7 @@ class CameraReceiver:
         self._near_threshold = 70
         self._line_color_space = "lab"
         self._auto_threshold_enabled = False
-        self._auto_threshold_update_interval_sec = 1.0
+        self._auto_threshold_update_interval_sec = 2.5
         self._last_auto_threshold_update_ts = 0.0
         self._last_remote_feature_ts = 0.0
         self._debug_overlay_enabled = True
@@ -494,7 +494,7 @@ class CameraReceiver:
                 round(float(far_otsu) * 0.90),
             )
             far_target = int(np.clip(far_target, 40, 185))
-            far_threshold = int(round((0.8 * far_threshold) + (0.2 * far_target)))
+            far_threshold = int(round((0.9 * far_threshold) + (0.1 * far_target)))
 
         if near_region.size > 0:
             near_median = float(np.median(near_region))
@@ -506,7 +506,7 @@ class CameraReceiver:
                 round(float(near_otsu) * 0.88),
             )
             near_target = int(np.clip(near_target, 30, 170))
-            near_threshold = int(round((0.8 * near_threshold) + (0.2 * near_target)))
+            near_threshold = int(round((0.9 * near_threshold) + (0.1 * near_target)))
 
         with self._lock:
             self._far_threshold = int(np.clip(far_threshold, 0, 255))
