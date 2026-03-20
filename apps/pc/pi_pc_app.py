@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import threading
 import tkinter as tk
 import time
@@ -9,6 +10,10 @@ import numpy as np
 import zmq
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Set, Tuple
+
+_SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared")
+if _SHARED_DIR not in sys.path:
+    sys.path.insert(0, _SHARED_DIR)
 
 from PIL import Image, ImageTk
 
@@ -151,31 +156,40 @@ class _LineDetectionWorker:
             frame = self._camera_receiver.get_latest_frame()
             show_binary = self._camera_receiver.is_show_binary_mask()
 
-            use_pi = False
-            if self._camera_receiver.is_remote_line_feature_mode() and not show_binary:
-                remote_age = self._camera_receiver.get_remote_feature_age_sec()
-                has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
-                if has_recent_remote:
-                    pi_features = self._camera_receiver.get_latest_line_features()
-                    pi_detected = any(
-                        pi_features.get(f"line_detect_{z}", 0.0) > 0.0
-                        for z in ("top", "mid", "bottom")
-                    )
-                    if pi_detected:
-                        use_pi = True
+            # Pi 側の検出結果のみを使用する
+            pi_features = self._camera_receiver.get_latest_line_features()
+            calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+            vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
+            features = pi_features
+            self._remote_stale_logged = False
 
-            if use_pi:
-                # Pi 検出成功 → 生フレーム処理の結果を採用
-                calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
-                vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
-                features = pi_features
-                self._remote_stale_logged = False
-            else:
-                # Pi 検出失敗 or 二値化表示 → PC 側でキャリブ込みの find_line() を実行
-                if not show_binary and not self._remote_stale_logged:
-                    logging.getLogger("pi_pc_app").debug("Pi detection failed. Running local find_line().")
-                vis = self._camera_receiver.find_line(frame)
-                features = self._camera_receiver.get_latest_line_features()
+            # --- PC 側フォールバック処理（将来の復元用にコメントアウト） ---
+            # use_pi = False
+            # if self._camera_receiver.is_remote_line_feature_mode() and not show_binary:
+            #     remote_age = self._camera_receiver.get_remote_feature_age_sec()
+            #     has_recent_remote = remote_age is not None and remote_age <= max(1.0, self._interval * 4.0)
+            #     if has_recent_remote:
+            #         pi_features = self._camera_receiver.get_latest_line_features()
+            #         pi_detected = any(
+            #             pi_features.get(f"line_detect_{z}", 0.0) > 0.0
+            #             for z in ("top", "mid", "bottom")
+            #         )
+            #         if pi_detected:
+            #             use_pi = True
+            #
+            # if use_pi:
+            #     # Pi 検出成功 → 生フレーム処理の結果を採用
+            #     calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+            #     vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
+            #     features = pi_features
+            #     self._remote_stale_logged = False
+            # else:
+            #     # Pi 検出失敗 or 二値化表示 → PC 側でキャリブ込みの find_line() を実行
+            #     if not show_binary and not self._remote_stale_logged:
+            #         logging.getLogger("pi_pc_app").debug("Pi detection failed. Running local find_line().")
+            #     vis = self._camera_receiver.find_line(frame)
+            #     features = self._camera_receiver.get_latest_line_features()
+            # --- PC 側フォールバック処理 ここまで ---
 
             with self._lock:
                 self._latest_vis = vis
