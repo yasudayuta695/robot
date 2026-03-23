@@ -166,3 +166,76 @@ sudo python3 apps/pi_main.py --mode remote --camera-fps 30
 - 直進でその場回転する: `comfig.txt` の `motor_left_sign`, `motor_right_sign` を見直す
 - ラインを見失いやすい: `line_color_space` を `lab` / `hsv` で切替、`auto_threshold_enabled=true` を試す、`far_threshold`, `near_threshold` を調整
 - 動きが荒い/遅い: `base-speed`, `ai_control_interval_ms`, `line_process_interval_ms` を見直す
+
+#comfig.txt(下地用)
+# Config file for data collection
+# 各PCで、このプロジェクトフォルダのパスを save_base_dir に設定してください
+# Linux例: save_base_dir=/home/ryuryu/lab/Robot_car
+# UNC例: save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
+
+save_base_dir=\\wsl.localhost\Ubuntu-24.04\home\ryuryu\lab\Robot_car
+
+# 速度基準（UI初期値）
+drive_speed_default=60
+# 十字キー速度の比率（drive_speed_defaultに対する倍率）
+dpad_drive_speed_scale=1.0
+dpad_turn_speed_scale=0.4
+# カーブ時の自動減速感度（0.0:無効、推奨0.4〜1.0）
+curve_slowdown_sensitivity=0.70
+# 推論出力の平滑化（0.0:無効 / 1.0:強い追従）
+ai_smoothing_alpha=0.80
+# AI制御モデルの履歴フレーム数（学習時の --history と合わせること）
+ai_history=5
+# ライン見失い時の保持フレーム数（長いほど復帰が遅くなる）
+ai_no_line_hold_frames=8
+# ライン見失い後の減速に使うフレーム数
+ai_no_line_brake_frames=10
+# ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
+line_process_interval_ms=60
+# カメラ配信プロファイル（low_latency / high_quality）
+# 低遅延重視は low_latency，画質重視は high_quality
+camera_stream_profile=low_latency
+# ライン抽出の色空間（lab または hsv）
+line_color_space=lab
+# ライン検出プロファイル（default=panel_seam_glare / panel_seam / glare / panel_seam_glare）
+line_detection_profile=glare
+# しきい値自動補正（見失いが多い場合は true 推奨）
+auto_threshold_enabled=true
+# 固定しきい値（auto_threshold_enabled=false のとき有効）
+far_threshold=84
+near_threshold=76
+# AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
+ai_control_interval_ms=100
+# UI更新周期(ms)
+ui_update_interval_ms=30
+
+# PID制御ゲイン（--mode pid で使用）
+pid_kp=0.95
+pid_ki=0.08
+pid_kd=0.22
+# PID出力の上限（操舵量）
+pid_output_limit=0.35
+# 積分項の上限（windup対策）
+pid_integral_limit=1.5
+# ライン未検出時に停止するか
+pid_stop_on_no_line=true
+# 学習ゲインの時間平滑化（0.0:平滑なし, 1.0:非常に強い追従）
+pid_gain_smoothing_alpha=0.40
+# 操舵量のフレーム間変化上限（小さいほど暴れにくい）
+pid_steer_rate_limit=0.5
+# モータ符号補正（直進でその場回転する場合は見直す）
+motor_left_sign=-1
+motor_right_sign=1
+
+# カメラ選択肢
+camera_id=camera_1
+camera_id=camera_2
+camera_id=camera_4
+default_camera_id=camera_4
+
+# 走行種別は drive_type= で複数行書けます
+drive_type=straight
+drive_type=recovery
+drive_type=left_curve
+drive_type=right_curve
+drive_type=stop_and_go
