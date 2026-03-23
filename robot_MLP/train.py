@@ -284,26 +284,44 @@ class DrivingLogSequenceDataset(Dataset):
         csv_paths: Sequence[str],
         history: int = 10,
         feature_columns: List[str] = FEATURE_COLUMNS,
+        label_shift: int = 0,
+        filter_contradictory: bool = False,
+        contradictory_offset_threshold: float = 0.15,
+        contradictory_steer_threshold: float = 0.05,
     ) -> None:
         if history <= 0:
             raise ValueError("history must be >= 1")
         if not csv_paths:
             raise ValueError("csv_paths is empty")
+        if label_shift < 0:
+            raise ValueError("label_shift must be >= 0")
 
         self.history = history
         self.feature_columns = feature_columns
+        self.label_shift = int(label_shift)
+        self.filter_contradictory = bool(filter_contradictory)
+        self.contradictory_offset_threshold = float(contradictory_offset_threshold)
+        self.contradictory_steer_threshold = float(contradictory_steer_threshold)
         self.sequence_sources: List[str] = []
         self.sequences: List[List[Sample]] = []
         self.index_map: List[Tuple[int, int]] = []
 
+        total_loaded = 0
+        total_filtered = 0
         for src in csv_paths:
-            seq = self._load_csv(src)
+            seq, n_loaded, n_filtered = self._load_csv(src)
+            total_loaded += n_loaded
+            total_filtered += n_filtered
             if len(seq) == 0:
                 continue
             seq_idx = len(self.sequences)
             self.sequence_sources.append(src)
             self.sequences.append(seq)
             self.index_map.extend((seq_idx, row_idx) for row_idx in range(len(seq)))
+
+        if self.filter_contradictory and total_loaded > 0:
+            ratio = 100.0 * total_filtered / total_loaded
+            print(f"[Info] filter_contradictory: {total_filtered}/{total_loaded} rows removed ({ratio:.1f}%)")
 
         if len(self.index_map) == 0:
             raise ValueError("No usable rows found in provided csv path(s)")
@@ -312,8 +330,14 @@ class DrivingLogSequenceDataset(Dataset):
     # 欠損時は 0.0 で補完する（警告のみ）。
     _OPTIONAL_COLUMNS = frozenset(["line_width_top", "line_width_mid", "line_width_bottom"])
 
-    def _load_csv(self, csv_path: str) -> List[Sample]:
+    def _load_csv(self, csv_path: str) -> Tuple[List[Sample], int, int]:
         loaded: List[Sample] = []
+        n_loaded = 0
+        n_filtered = 0
+
+        has_offset_mid = "line_offset_mid" in self.feature_columns
+        offset_mid_idx = self.feature_columns.index("line_offset_mid") if has_offset_mid else -1
+
         with open(csv_path, "r", newline="") as f:
             reader = csv.DictReader(f)
             fieldnames = set(reader.fieldnames or [])
@@ -333,13 +357,23 @@ class DrivingLogSequenceDataset(Dataset):
                 except (TypeError, ValueError) as e:
                     raise ValueError(f"Invalid numeric value at row {row_idx + 2}: {e}") from e
 
+                n_loaded += 1
+
+                # 矛盾データ除去: ラインがずれているのに操舵していないフレームを除外
+                if self.filter_contradictory and has_offset_mid:
+                    offset_mid = feature_vals[offset_mid_idx]
+                    steer_diff = abs(target_vals[0] - target_vals[1])
+                    if abs(offset_mid) > self.contradictory_offset_threshold and steer_diff < self.contradictory_steer_threshold:
+                        n_filtered += 1
+                        continue
+
                 loaded.append(
                     Sample(
                         feature=np.asarray(feature_vals, dtype=np.float32),
                         target=np.asarray(target_vals, dtype=np.float32),
                     )
                 )
-        return loaded
+        return loaded, n_loaded, n_filtered
 
     def __len__(self) -> int:
         return len(self.index_map)
@@ -360,7 +394,8 @@ class DrivingLogSequenceDataset(Dataset):
 
         idxs = self._window_indices(row_idx)
         stacked = np.concatenate([seq[i].feature for i in idxs], axis=0)  # (history*9,)
-        target = seq[row_idx].target  # (2,)
+        target_idx = min(row_idx + self.label_shift, len(seq) - 1)
+        target = seq[target_idx].target  # (2,)
 
         x = torch.from_numpy(stacked)
         y = torch.from_numpy(target)
@@ -587,8 +622,8 @@ def train(args: argparse.Namespace) -> None:
         if len(train_csvs) == 0:
             raise ValueError("No training CSVs after split. Check dataset size and split ratios.")
 
-        train_set = DrivingLogSequenceDataset(csv_paths=train_csvs, history=args.history, feature_columns=feature_columns)
-        val_set = DrivingLogSequenceDataset(csv_paths=val_csvs, history=args.history, feature_columns=feature_columns) if len(val_csvs) > 0 else None
+        train_set = DrivingLogSequenceDataset(csv_paths=train_csvs, history=args.history, feature_columns=feature_columns, label_shift=args.label_shift, filter_contradictory=args.filter_contradictory, contradictory_offset_threshold=args.contradictory_offset_threshold, contradictory_steer_threshold=args.contradictory_steer_threshold)
+        val_set = DrivingLogSequenceDataset(csv_paths=val_csvs, history=args.history, feature_columns=feature_columns, label_shift=args.label_shift, filter_contradictory=args.filter_contradictory, contradictory_offset_threshold=args.contradictory_offset_threshold, contradictory_steer_threshold=args.contradictory_steer_threshold) if len(val_csvs) > 0 else None
         print(
             f"Loaded {len(csv_paths)} csv file(s) from directory. "
             f"holdout_unit={args.holdout_unit} "
@@ -598,7 +633,7 @@ def train(args: argparse.Namespace) -> None:
         if args.split_report_path:
             save_split_report(args.split_report_path, train_csvs, val_csvs, test_csvs)
     else:
-        dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history, feature_columns=feature_columns)
+        dataset = DrivingLogSequenceDataset(csv_paths=csv_paths, history=args.history, feature_columns=feature_columns, label_shift=args.label_shift, filter_contradictory=args.filter_contradictory, contradictory_offset_threshold=args.contradictory_offset_threshold, contradictory_steer_threshold=args.contradictory_steer_threshold)
         print(f"Loaded {len(csv_paths)} csv file(s), total rows={len(dataset)}")
 
         train_idx, val_idx = split_indices_sequential(len(dataset), args.val_ratio)
@@ -810,6 +845,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curve-path", type=str, default="learning_curve.png", help="Output path for learning curve image")
     parser.add_argument("--no-curve", action="store_true", help="Disable saving learning curve image")
     parser.add_argument("--no-augment", action="store_true", help="Disable left-right flip augmentation for training data")
+    parser.add_argument("--label-shift", type=int, default=0, help="Shift target labels N frames into the future to compensate for dpad reaction delay")
+    parser.add_argument("--filter-contradictory", action="store_true", help="除去矛盾データ: ラインがずれているのに操舵していないフレームを学習から除外する")
+    parser.add_argument("--contradictory-offset-threshold", type=float, default=0.15, help="カーブ判定のoffset_mid閾値 (default: 0.15)")
+    parser.add_argument("--contradictory-steer-threshold", type=float, default=0.05, help="操舵なし判定のモータ差動閾値(正規化値) (default: 0.05 = 5/100)")
     parser.add_argument("--no-motor-feedback", action="store_true", help="Exclude current_left_norm/current_right_norm from features (input: history x 7)")
     parser.add_argument("--seed", type=int, default=42)
     return parser

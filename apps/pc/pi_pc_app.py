@@ -17,6 +17,7 @@ if _SHARED_DIR not in sys.path:
 
 from PIL import Image, ImageTk
 
+from cnn_motor_controller import CnnMotorONNXController
 from lstm_pid_controller import LSTMPIDONNXController
 from pid_learned_controller import LearnedPIDONNXController
 from camera_receiver import CameraReceiver
@@ -67,6 +68,7 @@ class _LineDetectionWorker:
         self._lock = threading.Lock()
         self._latest_vis: Optional[np.ndarray] = None
         self._latest_features: Dict[str, float] = camera_receiver.get_latest_line_features()
+        self._latest_mask: Optional[np.ndarray] = None
         self._remote_stale_logged = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -199,9 +201,11 @@ class _LineDetectionWorker:
             #     features = self._camera_receiver.get_latest_line_features()
             # --- PC 側フォールバック処理 ここまで ---
 
+            mask = self._camera_receiver.get_last_mask()
             with self._lock:
                 self._latest_vis = vis
                 self._latest_features = features
+                self._latest_mask = mask
 
             next_tick += self._interval
             sleep_sec = next_tick - time.perf_counter()
@@ -211,10 +215,11 @@ class _LineDetectionWorker:
                 # 処理が間隔を超過した場合はドリフトをリセット
                 next_tick = time.perf_counter()
 
-    def get_latest(self) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
+    def get_latest(self) -> Tuple[Optional[np.ndarray], Dict[str, float], Optional[np.ndarray]]:
         with self._lock:
             vis = self._latest_vis.copy() if self._latest_vis is not None else None
-            return vis, self._latest_features.copy()
+            mask = self._latest_mask.copy() if self._latest_mask is not None else None
+            return vis, self._latest_features.copy(), mask
 
     def stop(self) -> None:
         self._running = False
@@ -287,7 +292,7 @@ class UnifiedApp:
         self._calib_resend_thread.start()
         self.recorder = DataRecorder(self.config.save_base_dir, self.logger)
         self.ai_controller = LearnedPIDONNXController(
-            history=10,
+            history=self.config.ai_history,
             smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             stop_on_no_line=True,
@@ -296,12 +301,24 @@ class UnifiedApp:
             gain_smoothing_alpha=self.config.pid_gain_smoothing_alpha,
             steer_rate_limit=self.config.pid_steer_rate_limit,
         )
+        self.cnn_controller = CnnMotorONNXController(
+            smoothing_alpha=self.config.ai_smoothing_alpha,
+            max_motor_speed=100,
+            no_line_hold_frames=self.config.ai_no_line_hold_frames,
+            no_line_brake_frames=self.config.ai_no_line_brake_frames,
+        )
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
         self.ui_update_interval_ms = max(10, int(self.config.ui_update_interval_ms))
         self._last_ai_control_time = 0.0
+        self._last_pid_control_time = 0.0
+        self._last_cnn_control_time = 0.0
+        self._pid_integral: float = 0.0
+        self._pid_prev_error: float = 0.0
+        self._pid_no_line_frames: int = 0
         self._cached_line_vis = None
         self._cached_line_features = self.camera_receiver.get_latest_line_features()
+        self._cached_mask: Optional[np.ndarray] = None
         self._coord_stream_interval_sec = COORD_STREAM_INTERVAL_SEC
         self._coord_stream_last_ts = 0.0
         self._coord_stream_line_count = 0
@@ -611,7 +628,7 @@ class UnifiedApp:
 
         self.coord_text = tk.Text(
             self.coord_panel,
-            width=56,
+            width=36,
             height=29,
             font=("Courier", 9),
             wrap="none",
@@ -648,6 +665,20 @@ class UnifiedApp:
             value="ai",
             command=self.on_mode_change,
         ).pack(anchor="w")
+        tk.Radiobutton(
+            mode_frame,
+            text="PID制御",
+            variable=self.control_mode,
+            value="pid",
+            command=self.on_mode_change,
+        ).pack(anchor="w")
+        tk.Radiobutton(
+            mode_frame,
+            text="CNN (画像入力)",
+            variable=self.control_mode,
+            value="cnn",
+            command=self.on_mode_change,
+        ).pack(anchor="w")
         self.emergency_status_var = tk.StringVar(value="Emergency stop standby (hold Space/Esc)")
         self.emergency_status_label = tk.Label(
             mode_frame,
@@ -675,6 +706,43 @@ class UnifiedApp:
         self.ai_status_label = tk.Label(self.ai_frame, textvariable=self.ai_status_var, fg="gray30", anchor="w")
         self.ai_status_label.grid(row=1, column=0, columnspan=4, padx=6, pady=(0, 6), sticky="we")
         self.ai_frame.grid_columnconfigure(1, weight=1)
+
+        self.cnn_frame = tk.LabelFrame(self.joy_frame, text="CNN Controller")
+        self.cnn_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(self.cnn_frame, text="ONNX:").grid(row=0, column=0, padx=(6, 4), pady=6, sticky="w")
+        default_cnn_path = os.path.join(self.project_dir, "robot_MLP", "model_cnn.onnx")
+        self.cnn_model_path_var = tk.StringVar(value=default_cnn_path)
+        self.cnn_model_path_entry = tk.Entry(self.cnn_frame, textvariable=self.cnn_model_path_var, width=36)
+        self.cnn_model_path_entry.grid(row=0, column=1, padx=(0, 6), pady=6, sticky="we")
+
+        self.cnn_load_btn = tk.Button(self.cnn_frame, text="Load", command=self.load_cnn_model)
+        self.cnn_load_btn.grid(row=0, column=2, padx=(0, 6), pady=6)
+
+        self.cnn_reset_btn = tk.Button(self.cnn_frame, text="Reset", command=self.reset_cnn_state)
+        self.cnn_reset_btn.grid(row=0, column=3, padx=(0, 6), pady=6)
+
+        self.cnn_status_var = tk.StringVar(value="CNN model: not loaded")
+        tk.Label(self.cnn_frame, textvariable=self.cnn_status_var, fg="gray30", anchor="w").grid(
+            row=1, column=0, columnspan=4, padx=6, pady=(0, 6), sticky="we"
+        )
+        self.cnn_frame.grid_columnconfigure(1, weight=1)
+
+        self.pid_gain_frame = tk.LabelFrame(self.joy_frame, text="PID ゲイン")
+        self.pid_gain_frame.pack(fill=tk.X, pady=(0, 10))
+        self.pid_kp_var = tk.DoubleVar(value=self.config.pid_kp)
+        self.pid_ki_var = tk.DoubleVar(value=self.config.pid_ki)
+        self.pid_kd_var = tk.DoubleVar(value=self.config.pid_kd)
+        for row, (label, var, from_, to, res) in enumerate([
+            ("Kp", self.pid_kp_var, 0.0, 3.0, 0.05),
+            ("Ki", self.pid_ki_var, 0.0, 1.0, 0.01),
+            ("Kd", self.pid_kd_var, 0.0, 2.0, 0.05),
+        ]):
+            tk.Label(self.pid_gain_frame, text=label, width=3).grid(row=row, column=0, padx=(6, 2), pady=2, sticky="e")
+            sl = tk.Scale(self.pid_gain_frame, variable=var, from_=from_, to=to, resolution=res,
+                          orient=tk.HORIZONTAL, length=160, showvalue=True)
+            sl.grid(row=row, column=1, padx=(0, 6), pady=2, sticky="we")
+        self.pid_gain_frame.grid_columnconfigure(1, weight=1)
 
         self.canvas = tk.Canvas(self.joy_frame, width=CENTER * 2, height=CENTER * 2, bg="white")
         self.canvas.pack(pady=20)
@@ -757,11 +825,14 @@ class UnifiedApp:
         bottom = self._extract_zone_coordinate("bottom", line_features, frame_w, zone_rows)
 
         tstr = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        kp, ki, kd = self.ai_controller.last_gains if self.ai_controller.is_loaded() else (0.0, 0.0, 0.0)
         line = (
             f"{tstr} | "
             f"top(x={top[0]:4d},y={top[1]:3d},off={top[2]:+5.2f},w={top[3]:3d},d={top[4]:.1f}) "
             f"mid(x={mid[0]:4d},y={mid[1]:3d},off={mid[2]:+5.2f},w={mid[3]:3d},d={mid[4]:.1f}) "
-            f"btm(x={bottom[0]:4d},y={bottom[1]:3d},off={bottom[2]:+5.2f},w={bottom[3]:3d},d={bottom[4]:.1f})"
+            f"btm(x={bottom[0]:4d},y={bottom[1]:3d},off={bottom[2]:+5.2f},w={bottom[3]:3d},d={bottom[4]:.1f}) "
+            f"motor(L={self.current_l_speed:+4d},R={self.current_r_speed:+4d}) "
+            f"gains(Kp={kp:.3f},Ki={ki:.3f},Kd={kd:.3f})"
         )
         self.coord_text.insert("end", line + "\n")
         self._coord_stream_line_count += 1
@@ -1029,6 +1100,10 @@ class UnifiedApp:
         self.send_command(0, 0)
         self.reset_ai_state()
         self._last_ai_control_time = 0.0
+        self._last_pid_control_time = 0.0
+        self._pid_integral = 0.0
+        self._pid_prev_error = 0.0
+        self._pid_no_line_frames = 0
         self.canvas.coords(
             self.stick,
             CENTER - STICK_RADIUS,
@@ -1042,6 +1117,16 @@ class UnifiedApp:
         elif self.control_mode.get() == "dpad":
             self.canvas.pack_forget()
             self.dpad_frame.pack(pady=20)
+        elif self.control_mode.get() == "pid":
+            self.canvas.pack_forget()
+            self.dpad_frame.pack_forget()
+        elif self.control_mode.get() == "cnn":
+            self.canvas.pack_forget()
+            self.dpad_frame.pack_forget()
+            self.cnn_controller.reset_state()
+            self._last_cnn_control_time = 0.0
+            if not self.cnn_controller.is_loaded():
+                self.load_cnn_model()
         else:
             self.canvas.pack_forget()
             self.dpad_frame.pack_forget()
@@ -1100,7 +1185,7 @@ class UnifiedApp:
         use_lstm = "lstm" in os.path.basename(model_path).lower()
         cls = LSTMPIDONNXController if use_lstm else LearnedPIDONNXController
         return cls(
-            history=10,
+            history=self.config.ai_history,
             smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             stop_on_no_line=True,
@@ -1137,6 +1222,43 @@ class UnifiedApp:
         self._ai_error_logged = False
         self._last_ai_control_time = 0.0
 
+    def load_cnn_model(self) -> None:
+        model_path = self.cnn_model_path_var.get().strip()
+        if not model_path:
+            self.cnn_status_var.set("CNN model: path is empty")
+            return
+        if not os.path.isfile(model_path):
+            self.cnn_status_var.set(f"CNN model not found: {model_path}")
+            self.logger.warning("CNN model not found: %s", model_path)
+            return
+        try:
+            self.cnn_controller.load_model(model_path)
+            self.cnn_status_var.set(f"CNN model loaded: {model_path}")
+            self.logger.info("CNN ONNX model loaded: %s", to_wsl_unc_path(model_path, self.wsl_distro_name))
+        except Exception as exc:
+            self.cnn_status_var.set(f"CNN load failed: {exc}")
+            self.logger.warning("CNN model load failed: %s", exc)
+
+    def reset_cnn_state(self) -> None:
+        self.cnn_controller.reset_state()
+        self._last_cnn_control_time = 0.0
+
+    def run_cnn_control(self, mask: np.ndarray) -> None:
+        if not self.cnn_controller.is_loaded():
+            self.send_command(0, 0)
+            return
+        try:
+            left_speed, right_speed = self.cnn_controller.predict_motor_speed(
+                mask_gray=mask,
+                current_left_speed=self.current_l_speed,
+                current_right_speed=self.current_r_speed,
+                base_speed=self.get_drive_speed(),
+            )
+            self.send_command(left_speed, right_speed)
+        except Exception as exc:
+            self.logger.warning("CNN inference failed: %s", exc)
+            self.send_command(0, 0)
+
     def run_ai_control(self, line_features: Dict[str, float]) -> None:
         if not self.ai_controller.is_loaded():
             self.send_command(0, 0)
@@ -1157,15 +1279,70 @@ class UnifiedApp:
                 self._ai_error_logged = True
             self.send_command(0, 0)
 
+    def run_pid_control(self, line_features: Dict[str, float]) -> None:
+        kp = float(self.pid_kp_var.get())
+        ki = float(self.pid_ki_var.get())
+        kd = float(self.pid_kd_var.get())
+        output_limit = float(self.config.pid_output_limit)
+        integral_limit = float(self.config.pid_integral_limit)
+        base_speed = self.get_drive_speed()
+
+        # ゾーン重み付き誤差を計算（top/mid/btm で重み 0.20/0.35/0.45）
+        zone_weights = {"top": 0.20, "mid": 0.35, "bottom": 0.45}
+        weighted_sum = 0.0
+        weighted_err = 0.0
+        for zone, w in zone_weights.items():
+            d = float(line_features.get(f"line_detect_{zone}", 0.0))
+            o = float(line_features.get(f"line_offset_{zone}", 0.0))
+            weighted_sum += d * w
+            weighted_err += d * w * o
+
+        if weighted_sum < 0.01:
+            self._pid_no_line_frames += 1
+            hold = self.config.ai_no_line_hold_frames
+            brake = self.config.ai_no_line_brake_frames
+            if self._pid_no_line_frames <= hold:
+                # 直前の出力を保持
+                self.send_command(self.current_l_speed, self.current_r_speed)
+            elif self._pid_no_line_frames <= hold + brake:
+                # 徐々に減速
+                step = self._pid_no_line_frames - hold
+                scale = max(0.15, 1.0 - float(step) / float(brake))
+                self.send_command(
+                    int(self.current_l_speed * scale),
+                    int(self.current_r_speed * scale),
+                )
+            else:
+                # 停止・状態リセット
+                self._pid_integral = 0.0
+                self._pid_prev_error = 0.0
+                self.send_command(0, 0)
+            return
+
+        self._pid_no_line_frames = 0
+
+        error = weighted_err / weighted_sum
+        self._pid_integral = float(np.clip(self._pid_integral + error, -integral_limit, integral_limit))
+        derivative = error - self._pid_prev_error
+        self._pid_prev_error = error
+
+        steer = float(np.clip(kp * error + ki * self._pid_integral + kd * derivative, -output_limit, output_limit))
+        left_norm = float(np.clip(base_speed / 100.0 + steer, -1.0, 1.0))
+        right_norm = float(np.clip(base_speed / 100.0 - steer, -1.0, 1.0))
+        left_speed = int(np.clip(round(left_norm * 100.0), -100, 100))
+        right_speed = int(np.clip(round(right_norm * 100.0), -100, 100))
+        self.send_command(left_speed, right_speed)
+
     def update_camera_frame(self) -> None:
         frame = self.camera_receiver.get_latest_frame()
         now = time.perf_counter()
 
         # バックグラウンドスレッドから最新のライン検出結果を取得
-        line_vis, line_features_from_worker = self._line_worker.get_latest()
+        line_vis, line_features_from_worker, mask_from_worker = self._line_worker.get_latest()
         if line_vis is not None:
             self._cached_line_vis = line_vis
             self._cached_line_features = line_features_from_worker
+            self._cached_mask = mask_from_worker
 
         display_src = self._cached_line_vis if self._cached_line_vis is not None else frame
         display_frame = cv2.cvtColor(display_src, cv2.COLOR_BGR2RGB)
@@ -1182,13 +1359,24 @@ class UnifiedApp:
             if (now - self._last_ai_control_time) >= self.ai_control_interval_sec:
                 self.run_ai_control(line_features)
                 self._last_ai_control_time = now
-        
+        elif self.control_mode.get() == "pid":
+            if (now - self._last_pid_control_time) >= self.ai_control_interval_sec:
+                self.run_pid_control(line_features)
+                self._last_pid_control_time = now
+        elif self.control_mode.get() == "cnn":
+            if (now - self._last_cnn_control_time) >= self.ai_control_interval_sec:
+                if self._cached_mask is not None:
+                    self.run_cnn_control(self._cached_mask)
+                else:
+                    self.send_command(0, 0)
+                self._last_cnn_control_time = now
+
         pil_image = Image.fromarray(display_frame)
         tk_image = ImageTk.PhotoImage(image=pil_image)
         self.camera_label.config(image=tk_image)
         self.camera_label.image = tk_image
 
-        if self.recorder.state == RecorderState.RECORDING:
+        if self.recorder.state == RecorderState.RECORDING or self.control_mode.get() in ("ai", "pid", "cnn"):
             self._append_coordinate_stream(
                 line_features=line_features,
                 frame_w=display_frame.shape[1],
@@ -1204,6 +1392,7 @@ class UnifiedApp:
             drive_speed_base=self.get_drive_speed(),
             control_mode=self.control_mode.get(),
             interval_sec=DATA_RECORD_INTERVAL_SEC,
+            mask_gray=self._cached_mask,
         )
 
         self.root.after(self.ui_update_interval_ms, self.update_camera_frame)

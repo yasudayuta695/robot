@@ -1,0 +1,14 @@
+{
+  "train": [
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260320_134018_886267/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260320_134106_956983/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260323_104409_558864/driving_log.csv",
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260323_104617_723301/driving_log.csv"
+  ],
+  "val": [
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260320_134041_678694/driving_log.csv"
+  ],
+  "test": [
+    "/home/ryuryu/lab/Robot_car/apps/dataset/camera_1/straight/20260320_134132_715450/driving_log.csv"
+  ]
+}

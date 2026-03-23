@@ -16,8 +16,14 @@ class AppConfig:
     dpad_turn_speed_scale: float
     curve_slowdown_sensitivity: float
     ai_smoothing_alpha: float
+    ai_history: int
     ai_no_line_hold_frames: int
     ai_no_line_brake_frames: int
+    pid_kp: float
+    pid_ki: float
+    pid_kd: float
+    pid_output_limit: float
+    pid_integral_limit: float
     pid_gain_smoothing_alpha: float
     pid_steer_rate_limit: float
     line_process_interval_ms: int
@@ -78,8 +84,14 @@ def load_config(
     configured_dpad_turn_scale = default_dpad_turn_scale
     configured_curve_slowdown_sensitivity = 0.70
     configured_ai_smoothing_alpha = 0.35
+    configured_ai_history = 10
     configured_ai_no_line_hold_frames = 3
     configured_ai_no_line_brake_frames = 8
+    configured_pid_kp = 0.95
+    configured_pid_ki = 0.08
+    configured_pid_kd = 0.22
+    configured_pid_output_limit = 0.35
+    configured_pid_integral_limit = 1.5
     configured_pid_gain_smoothing_alpha = 0.25
     configured_pid_steer_rate_limit = 0.18
     configured_line_process_interval_ms = 70
@@ -131,6 +143,11 @@ def load_config(
                         configured_ai_smoothing_alpha = float(value)
                     except ValueError:
                         logger.warning("Invalid ai_smoothing_alpha: %s", value)
+                elif key == "ai_history" and value:
+                    try:
+                        configured_ai_history = int(float(value))
+                    except ValueError:
+                        logger.warning("Invalid ai_history: %s", value)
                 elif key == "ai_no_line_hold_frames" and value:
                     try:
                         configured_ai_no_line_hold_frames = int(float(value))
@@ -141,6 +158,31 @@ def load_config(
                         configured_ai_no_line_brake_frames = int(float(value))
                     except ValueError:
                         logger.warning("Invalid ai_no_line_brake_frames: %s", value)
+                elif key == "pid_kp" and value:
+                    try:
+                        configured_pid_kp = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_kp: %s", value)
+                elif key == "pid_ki" and value:
+                    try:
+                        configured_pid_ki = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_ki: %s", value)
+                elif key == "pid_kd" and value:
+                    try:
+                        configured_pid_kd = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_kd: %s", value)
+                elif key == "pid_output_limit" and value:
+                    try:
+                        configured_pid_output_limit = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_output_limit: %s", value)
+                elif key == "pid_integral_limit" and value:
+                    try:
+                        configured_pid_integral_limit = float(value)
+                    except ValueError:
+                        logger.warning("Invalid pid_integral_limit: %s", value)
                 elif key == "pid_gain_smoothing_alpha" and value:
                     try:
                         configured_pid_gain_smoothing_alpha = float(value)
@@ -218,8 +260,14 @@ def load_config(
 
     configured_curve_slowdown_sensitivity = max(0.0, min(2.0, float(configured_curve_slowdown_sensitivity)))
     configured_ai_smoothing_alpha = max(0.0, min(1.0, float(configured_ai_smoothing_alpha)))
+    configured_ai_history = max(1, min(50, int(configured_ai_history)))
     configured_ai_no_line_hold_frames = max(0, min(60, int(configured_ai_no_line_hold_frames)))
     configured_ai_no_line_brake_frames = max(1, min(120, int(configured_ai_no_line_brake_frames)))
+    configured_pid_kp = max(0.0, min(10.0, float(configured_pid_kp)))
+    configured_pid_ki = max(0.0, min(5.0, float(configured_pid_ki)))
+    configured_pid_kd = max(0.0, min(5.0, float(configured_pid_kd)))
+    configured_pid_output_limit = max(0.01, min(1.0, float(configured_pid_output_limit)))
+    configured_pid_integral_limit = max(0.0, min(10.0, float(configured_pid_integral_limit)))
     configured_pid_gain_smoothing_alpha = max(0.0, min(1.0, float(configured_pid_gain_smoothing_alpha)))
     configured_pid_steer_rate_limit = max(0.01, min(1.0, float(configured_pid_steer_rate_limit)))
     configured_line_process_interval_ms = max(20, min(300, int(configured_line_process_interval_ms)))
@@ -246,8 +294,14 @@ def load_config(
         dpad_turn_speed_scale=configured_dpad_turn_scale,
         curve_slowdown_sensitivity=configured_curve_slowdown_sensitivity,
         ai_smoothing_alpha=configured_ai_smoothing_alpha,
+        ai_history=configured_ai_history,
         ai_no_line_hold_frames=configured_ai_no_line_hold_frames,
         ai_no_line_brake_frames=configured_ai_no_line_brake_frames,
+        pid_kp=configured_pid_kp,
+        pid_ki=configured_pid_ki,
+        pid_kd=configured_pid_kd,
+        pid_output_limit=configured_pid_output_limit,
+        pid_integral_limit=configured_pid_integral_limit,
         pid_gain_smoothing_alpha=configured_pid_gain_smoothing_alpha,
         pid_steer_rate_limit=configured_pid_steer_rate_limit,
         line_process_interval_ms=configured_line_process_interval_ms,

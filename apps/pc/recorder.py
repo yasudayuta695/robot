@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -43,6 +43,7 @@ class DataRecorder:
         self.save_base_dir = save_base_dir
         self.temp_dir = os.path.join(self.save_base_dir, "temp_record")
         self.temp_img_dir = os.path.join(self.temp_dir, "images")
+        self.temp_mask_dir = os.path.join(self.temp_dir, "masks")
         self.temp_csv_path = os.path.join(self.temp_dir, "driving_log.csv")
         self.state: RecorderState = RecorderState.IDLE
         self.csv_file = None
@@ -61,6 +62,7 @@ class DataRecorder:
             if os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
             os.makedirs(self.temp_img_dir, exist_ok=True)
+            os.makedirs(self.temp_mask_dir, exist_ok=True)
 
             self.csv_file = open(self.temp_csv_path, mode="w", newline="")
             self.csv_writer = csv.writer(self.csv_file)
@@ -138,6 +140,7 @@ class DataRecorder:
         drive_speed_base: int,
         control_mode: str,
         interval_sec: float = 0.1,
+        mask_gray: Optional[np.ndarray] = None,
     ) -> None:
         if self.state != RecorderState.RECORDING or self.csv_writer is None:
             return
@@ -154,6 +157,11 @@ class DataRecorder:
 
         bgr_img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(filepath, bgr_img)
+
+        if mask_gray is not None:
+            mask_filename = os.path.splitext(filename)[0] + ".png"
+            mask_filepath = os.path.join(self.temp_mask_dir, mask_filename)
+            cv2.imwrite(mask_filepath, mask_gray)
 
         target_left_norm = float(np.clip(left_speed / 100.0, -1.0, 1.0))
         target_right_norm = float(np.clip(right_speed / 100.0, -1.0, 1.0))
@@ -202,6 +210,7 @@ class DataRecorder:
         recording_duration_sec: float,
     ) -> None:
         final_img_dir = os.path.join(base_dir, "image")
+        final_mask_dir = os.path.join(base_dir, "mask")
         final_csv_path = os.path.join(base_dir, "driving_log.csv")
 
         os.makedirs(final_img_dir, exist_ok=True)
@@ -212,6 +221,13 @@ class DataRecorder:
             dst = os.path.join(final_img_dir, img_file)
             shutil.move(src, dst)
             moved_count += 1
+
+        if os.path.exists(self.temp_mask_dir) and os.listdir(self.temp_mask_dir):
+            os.makedirs(final_mask_dir, exist_ok=True)
+            for mask_file in os.listdir(self.temp_mask_dir):
+                src = os.path.join(self.temp_mask_dir, mask_file)
+                dst = os.path.join(final_mask_dir, mask_file)
+                shutil.move(src, dst)
 
         file_exists = os.path.isfile(final_csv_path)
         with open(final_csv_path, mode="a", newline="") as f_out:
