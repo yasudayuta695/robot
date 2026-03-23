@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(python train_image.py --csv-path ../apps/dataset/camera_1 --epochs 2 --no-curve --weights-path /tmp/model_cnn_test.pt --onnx-path /tmp/model_cnn_test.onnx)"
     ]
   }
 }

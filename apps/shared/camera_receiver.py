@@ -118,6 +118,7 @@ class CameraReceiver:
         self._line_detection_config = build_line_detection_profile(DEFAULT_LINE_DETECTION_PROFILE)
         self._calibrated_width_norm: Optional[float] = None
         self._last_width_med_norm: float = 0.0
+        self._last_mask: Optional[np.ndarray] = None
         self._show_binary_mask: bool = False
         self._segmentation_enabled: bool = False
         self._segmentation_threshold: float = 0.5
@@ -402,6 +403,10 @@ class CameraReceiver:
     def get_latest_line_features(self) -> Dict[str, float]:
         with self._lock:
             return self._latest_line_features.copy()
+
+    def get_last_mask(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._last_mask.copy() if self._last_mask is not None else None
 
     def get_thresholds(self) -> Tuple[int, int]:
         with self._lock:
@@ -1151,11 +1156,16 @@ class CameraReceiver:
                 frame_width=w,
             )
 
+        # フルフレームマスクをキャッシュ（データ収集時の保存用）
+        _cache_mask = np.zeros((h, w), dtype=np.uint8)
+        if mask is not None and mask.size > 0:
+            _cache_mask[roi_top:roi_top + roi_h, :] = mask
+        with self._lock:
+            self._last_mask = _cache_mask
+
         if show_binary:
             # マスクを BGR に変換して vis を差し替え（検出オーバーレイはこの上に描く）
-            mask_full = np.zeros((h, w), dtype=np.uint8)
-            mask_full[roi_top:, :] = mask
-            vis = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
+            vis = cv2.cvtColor(_cache_mask, cv2.COLOR_GRAY2BGR)
 
         # 3分割ガイド（遠/中/近）: ROI内を均等3分割
         _roi_available = h - roi_top

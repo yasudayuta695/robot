@@ -192,36 +192,43 @@ class LearnedPIDONNXController:
         self._net.setInput(inp)
         output = self._net.forward()
         out = np.asarray(output, dtype=np.float32).reshape(-1)
-        if out.size < 3:
-            raise RuntimeError(f"Unexpected ONNX output shape for PID gains: {output.shape}")
 
-        kp_raw = float(np.clip(out[0], 0.0, 5.0))
-        ki_raw = float(np.clip(out[1], 0.0, 5.0))
-        kd_raw = float(np.clip(out[2], 0.0, 5.0))
+        if out.size == 2:
+            # motor モード: モデルが左右モータ値を直接出力
+            left_norm = float(np.clip(out[0], -1.0, 1.0))
+            right_norm = float(np.clip(out[1], -1.0, 1.0))
+            self._last_gains = (0.0, 0.0, 0.0)
+        elif out.size >= 3:
+            # pid-gain モード
+            kp_raw = float(np.clip(out[0], 0.0, 5.0))
+            ki_raw = float(np.clip(out[1], 0.0, 5.0))
+            kd_raw = float(np.clip(out[2], 0.0, 5.0))
 
-        g = self.gain_smoothing_alpha
-        kp_prev, ki_prev, kd_prev = self._last_gains
-        kp = ((1.0 - g) * kp_prev) + (g * kp_raw)
-        ki = ((1.0 - g) * ki_prev) + (g * ki_raw)
-        kd = ((1.0 - g) * kd_prev) + (g * kd_raw)
-        self._last_gains = (kp, ki, kd)
+            g = self.gain_smoothing_alpha
+            kp_prev, ki_prev, kd_prev = self._last_gains
+            kp = ((1.0 - g) * kp_prev) + (g * kp_raw)
+            ki = ((1.0 - g) * ki_prev) + (g * ki_raw)
+            kd = ((1.0 - g) * kd_prev) + (g * kd_raw)
+            self._last_gains = (kp, ki, kd)
 
-        steer_target = (kp * error) + (ki * integral) + (kd * derivative)
-        steer_target = float(np.clip(steer_target, -self.steer_limit, self.steer_limit))
+            steer_target = (kp * error) + (ki * integral) + (kd * derivative)
+            steer_target = float(np.clip(steer_target, -self.steer_limit, self.steer_limit))
 
-        delta = steer_target - self._last_steer
-        max_delta = self.steer_rate_limit
-        if delta > max_delta:
-            steer = self._last_steer + max_delta
-        elif delta < -max_delta:
-            steer = self._last_steer - max_delta
+            delta = steer_target - self._last_steer
+            max_delta = self.steer_rate_limit
+            if delta > max_delta:
+                steer = self._last_steer + max_delta
+            elif delta < -max_delta:
+                steer = self._last_steer - max_delta
+            else:
+                steer = steer_target
+            steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
+            self._last_steer = steer
+
+            left_norm = float(np.clip(base_speed_norm + steer, -1.0, 1.0))
+            right_norm = float(np.clip(base_speed_norm - steer, -1.0, 1.0))
         else:
-            steer = steer_target
-        steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
-        self._last_steer = steer
-
-        left_norm = float(np.clip(base_speed_norm + steer, -1.0, 1.0))
-        right_norm = float(np.clip(base_speed_norm - steer, -1.0, 1.0))
+            raise RuntimeError(f"Unexpected ONNX output shape: {output.shape}")
 
         a = self.smoothing_alpha
         left_norm_smooth = ((1.0 - a) * self._left_norm_prev) + (a * left_norm)
