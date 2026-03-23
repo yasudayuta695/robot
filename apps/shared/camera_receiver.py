@@ -119,6 +119,13 @@ class CameraReceiver:
         self._calibrated_width_norm: Optional[float] = None
         self._last_width_med_norm: float = 0.0
         self._show_binary_mask: bool = False
+        self._segmentation_enabled: bool = False
+        self._segmentation_threshold: float = 0.5
+        self._seg_input_w: int = 160
+        self._seg_input_h: int = 120
+        self._seg_net: Optional[cv2.dnn.Net] = None
+        self._seg_model_path: str = ""
+        self._seg_failed_logged: bool = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -241,7 +248,11 @@ class CameraReceiver:
         h, w = frame.shape[:2]
         roi_top = int(h * 0.25)
         vis = frame.copy()
-        mask, roi_h, _, _, _ = self._build_line_mask(vis, roi_top, w)
+        seg_result = self._build_segmentation_mask(vis, roi_top, w) if self.is_segmentation_enabled() else None
+        if seg_result is not None:
+            mask, roi_h, _, _, _ = seg_result
+        else:
+            mask, roi_h, _, _, _ = self._build_line_mask(vis, roi_top, w)
         full_mask = np.zeros((h, w), dtype=np.uint8)
         if mask is not None and mask.size > 0:
             full_mask[roi_top:roi_top + roi_h] = mask
@@ -395,6 +406,93 @@ class CameraReceiver:
     def get_thresholds(self) -> Tuple[int, int]:
         with self._lock:
             return self._far_threshold, self._near_threshold
+
+    def load_segmentation_onnx(
+        self,
+        model_path: str,
+        threshold: float = 0.5,
+    ) -> bool:
+        model_path = str(model_path).strip()
+        if not model_path:
+            self.logger.warning("Seg ONNX path is empty")
+            return False
+        if not os.path.isfile(model_path):
+            self.logger.warning("Seg ONNX not found: %s", model_path)
+            return False
+
+        try:
+            net = cv2.dnn.readNetFromONNX(model_path)
+        except Exception as exc:
+            self.logger.warning("Seg ONNX load failed: %s", exc)
+            return False
+
+        with self._lock:
+            self._seg_net = net
+            self._seg_model_path = model_path
+            self._segmentation_threshold = float(np.clip(float(threshold), 0.05, 0.95))
+            self._seg_failed_logged = False
+        self.logger.info("Seg ONNX loaded: %s", model_path)
+        return True
+
+    def set_segmentation_enabled(self, enabled: bool) -> bool:
+        with self._lock:
+            if enabled and self._seg_net is None:
+                return False
+            self._segmentation_enabled = bool(enabled)
+            return self._segmentation_enabled
+
+    def is_segmentation_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._segmentation_enabled and self._seg_net is not None)
+
+    def _build_segmentation_mask(
+        self,
+        vis: np.ndarray,
+        roi_top: int,
+        frame_width: int,
+    ) -> Optional[tuple[np.ndarray, int, int, int, str]]:
+        _ = frame_width
+        with self._lock:
+            net = self._seg_net
+            threshold = float(self._segmentation_threshold)
+            in_w = int(self._seg_input_w)
+            in_h = int(self._seg_input_h)
+            far_threshold = int(self._far_threshold)
+            near_threshold = int(self._near_threshold)
+
+        if net is None:
+            return None
+
+        try:
+            gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
+            inp = cv2.resize(gray, (in_w, in_h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+            blob = inp[np.newaxis, np.newaxis, :, :]
+
+            net.setInput(blob)
+            out = net.forward()
+
+            if out.ndim == 4:
+                prob = out[0, 0]
+            elif out.ndim == 3:
+                prob = out[0]
+            else:
+                return None
+
+            seg_small = (prob >= threshold).astype(np.uint8) * 255
+            full_mask = cv2.resize(seg_small, (vis.shape[1], vis.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            roi_mask = full_mask[roi_top:, :]
+            roi_h = int(roi_mask.shape[0])
+            if roi_h <= 0:
+                return None
+
+            self._seg_failed_logged = False
+            return roi_mask, roi_h, far_threshold, near_threshold, "SEG"
+        except Exception as exc:
+            if not self._seg_failed_logged:
+                self.logger.warning("Seg inference failed. fallback to rule mask: %s", exc)
+                self._seg_failed_logged = True
+            return None
 
     def is_auto_threshold_enabled(self) -> bool:
         with self._lock:
@@ -1039,11 +1137,19 @@ class CameraReceiver:
 
         # 上部25%をカットして処理負荷を削減
         roi_top = int(h * 0.25)
-        mask, roi_h, far_threshold, near_threshold, intensity_mode = self._build_line_mask(
+        seg_result = self._build_segmentation_mask(
             vis=vis,
             roi_top=roi_top,
             frame_width=w,
-        )
+        ) if self.is_segmentation_enabled() else None
+        if seg_result is not None:
+            mask, roi_h, far_threshold, near_threshold, intensity_mode = seg_result
+        else:
+            mask, roi_h, far_threshold, near_threshold, intensity_mode = self._build_line_mask(
+                vis=vis,
+                roi_top=roi_top,
+                frame_width=w,
+            )
 
         if show_binary:
             # マスクを BGR に変換して vis を差し替え（検出オーバーレイはこの上に描く）

@@ -48,6 +48,7 @@ INNER_SPEED_SCALE = 0.9
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
+DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg.onnx")
 DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
 COORD_STREAM_INTERVAL_SEC = 0.05
@@ -155,13 +156,20 @@ class _LineDetectionWorker:
         while self._running:
             frame = self._camera_receiver.get_latest_frame()
             show_binary = self._camera_receiver.is_show_binary_mask()
+            use_local_seg = self._camera_receiver.is_segmentation_enabled()
 
-            # Pi 側の検出結果のみを使用する
-            pi_features = self._camera_receiver.get_latest_line_features()
-            calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
-            vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
-            features = pi_features
-            self._remote_stale_logged = False
+            if use_local_seg:
+                # セグ推論ON時は PC 側 find_line() を使用
+                vis = self._camera_receiver.find_line(frame)
+                features = self._camera_receiver.get_latest_line_features()
+                self._remote_stale_logged = False
+            else:
+                # Pi 側の検出結果を使用
+                pi_features = self._camera_receiver.get_latest_line_features()
+                calib_done = self._camera_receiver.get_calibrated_width_norm() is not None
+                vis = self._draw_remote_feature_overlay(frame, pi_features, calib_done=calib_done)
+                features = pi_features
+                self._remote_stale_logged = False
 
             # --- PC 側フォールバック処理（将来の復元用にコメントアウト） ---
             # use_pi = False
@@ -303,6 +311,8 @@ class UnifiedApp:
         )
         self._line_worker.start()
         self.ai_model_default_path = os.path.join(self.project_dir, DEFAULT_AI_MODEL_REL_PATH)
+        self.seg_model_default_path = os.path.join(self.project_dir, DEFAULT_SEG_MODEL_REL_PATH)
+        self._init_segmentation_model()
         self._ai_error_logged = False
 
         self.current_l_speed = 0
@@ -472,6 +482,15 @@ class UnifiedApp:
             command=self.on_toggle_show_binary,
         )
         self.show_binary_check.pack(side=tk.LEFT, padx=(12, 0))
+
+        self.segmentation_mode_var = tk.BooleanVar(value=self.camera_receiver.is_segmentation_enabled())
+        self.segmentation_mode_check = tk.Checkbutton(
+            self.threshold_frame,
+            text="Seg推論マスク",
+            variable=self.segmentation_mode_var,
+            command=self.on_toggle_segmentation,
+        )
+        self.segmentation_mode_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.offset_filter_frame = tk.Frame(self.main_frame)
         self.offset_filter_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
@@ -776,6 +795,30 @@ class UnifiedApp:
     def on_toggle_show_binary(self) -> None:
         enabled = bool(self.show_binary_var.get())
         self.camera_receiver.set_show_binary_mask(enabled)
+
+    def _init_segmentation_model(self) -> None:
+        if not os.path.isfile(self.seg_model_default_path):
+            self.logger.info("Seg model not found. rule mask mode: %s", self.seg_model_default_path)
+            self.camera_receiver.set_segmentation_enabled(False)
+            return
+
+        loaded = self.camera_receiver.load_segmentation_onnx(self.seg_model_default_path, threshold=0.50)
+        if not loaded:
+            self.camera_receiver.set_segmentation_enabled(False)
+            self.logger.warning("Seg model load failed. keep rule mask mode.")
+            return
+
+        self.camera_receiver.set_segmentation_enabled(True)
+        self.logger.info("Segmentation mode enabled: %s", self.seg_model_default_path)
+
+    def on_toggle_segmentation(self) -> None:
+        want_enabled = bool(self.segmentation_mode_var.get())
+        enabled = self.camera_receiver.set_segmentation_enabled(want_enabled)
+        self.segmentation_mode_var.set(enabled)
+        if enabled:
+            self.logger.info("Segmentation mode: ON")
+        else:
+            self.logger.info("Segmentation mode: OFF (rule mask)")
 
     def on_toggle_debug_overlay(self) -> None:
         enabled = self.camera_receiver.set_debug_overlay_enabled(bool(self.debug_overlay_var.get()))
