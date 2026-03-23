@@ -366,6 +366,7 @@ def export_onnx(model: nn.Module, save_path: str, device: torch.device) -> None:
     """
     model.eval()
     dummy = torch.zeros(1, 1, IMG_H, IMG_W, device=device)
+    # OpenCV DNN 互換のため、legacy exporter で固定形状モデルを出力する。
     torch.onnx.export(
         model,
         dummy,
@@ -373,7 +374,8 @@ def export_onnx(model: nn.Module, save_path: str, device: torch.device) -> None:
         opset_version=11,
         input_names=["input"],
         output_names=["output"],
-        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        do_constant_folding=True,
+        dynamo=False,
     )
     print(f"[export] ONNX 保存: {save_path}")
 

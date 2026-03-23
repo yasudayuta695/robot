@@ -232,7 +232,8 @@ class UnifiedApp:
         self.wsl_distro_name = os.environ.get("WSL_DISTRO_NAME", "Ubuntu-24.04")
         self.module_path = os.path.abspath(__file__)
         self.module_dir = os.path.dirname(self.module_path)
-        self.project_dir = os.path.dirname(self.module_dir)
+        # apps/pc/pi_pc_app.py から見て 2 階層上をプロジェクトルートとする
+        self.project_dir = os.path.dirname(os.path.dirname(self.module_dir))
 
         self.config_path = os.path.join(self.project_dir, "comfig.txt")
         legacy_config_path = os.path.join(self.project_dir, "drive_types.txt")
