@@ -18,3 +18,5 @@ env/
 *.png
 *.pt
 *.onnx
+
+*.data

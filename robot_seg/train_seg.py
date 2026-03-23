@@ -151,10 +151,54 @@ class SegDataset(Dataset):
     def _augment(
         img: np.ndarray, mask: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """左右反転のみの軽量拡張（コースの左右対称性を利用）。"""
+        """
+        軽量データ拡張。
+
+        幾何変換（反転・回転）は img/mask に同一変換を適用し、
+        マスク補間は最近傍でラベル崩れを防ぐ。
+        """
         if random.random() < 0.5:
             img  = img[:, ::-1].copy()
             mask = mask[:, ::-1].copy()
+
+        # 小角度回転で姿勢ずれ耐性を向上
+        if random.random() < 0.4:
+            angle = random.uniform(-7.0, 7.0)
+            center = (IMG_W * 0.5, IMG_H * 0.5)
+            mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+            img = cv2.warpAffine(
+                img,
+                mat,
+                (IMG_W, IMG_H),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            mask = cv2.warpAffine(
+                mask,
+                mat,
+                (IMG_W, IMG_H),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+
+        # 露出変化を模した明るさ/コントラスト変動
+        if random.random() < 0.5:
+            alpha = random.uniform(0.85, 1.15)  # contrast
+            beta = random.uniform(-0.08, 0.08)  # brightness
+            img = np.clip(img * alpha + beta, 0.0, 1.0)
+
+        # ガンマ変換で暗所/白飛び耐性を少し追加
+        if random.random() < 0.3:
+            gamma = random.uniform(0.85, 1.20)
+            img = np.clip(np.power(np.clip(img, 0.0, 1.0), gamma), 0.0, 1.0)
+
+        # 軽いブラーで微小なモーションブラー・ピンぼけを模擬
+        if random.random() < 0.2:
+            img = cv2.GaussianBlur(img, (3, 3), 0)
+
+        mask = (mask > 0.5).astype(np.float32)
+        img = img.astype(np.float32)
         return img, mask
 
 
