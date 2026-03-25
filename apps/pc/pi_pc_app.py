@@ -49,7 +49,7 @@ INNER_SPEED_SCALE = 0.9
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
-DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg.onnx")
+DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg_v2.onnx")
 DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
 COORD_STREAM_INTERVAL_SEC = 0.05
@@ -302,6 +302,7 @@ class UnifiedApp:
             steer_rate_limit=self.config.pid_steer_rate_limit,
         )
         self.cnn_controller = CnnMotorONNXController(
+            history=self.config.ai_history,
             smoothing_alpha=self.config.ai_smoothing_alpha,
             max_motor_speed=100,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,

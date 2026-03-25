@@ -13,13 +13,15 @@ dpad_turn_speed_scale=0.4
 # カーブ時の自動減速感度（0.0:無効、推奨0.4〜1.0）
 curve_slowdown_sensitivity=0.70
 # 推論出力の平滑化（0.0:無効 / 1.0:強い追従）
-ai_smoothing_alpha=0.35
+ai_smoothing_alpha=0.80
+# AI制御モデルの履歴フレーム数（学習時の --history と合わせること）
+ai_history=5
 # ライン見失い時の保持フレーム数（長いほど復帰が遅くなる）
-ai_no_line_hold_frames=4
+ai_no_line_hold_frames=8
 # ライン見失い後の減速に使うフレーム数
 ai_no_line_brake_frames=10
 # ライン処理周期(ms)。重いfind_lineを毎フレーム走らせないための間隔
-line_process_interval_ms=60
+line_process_interval_ms=30
 # カメラ配信プロファイル（low_latency / high_quality）
 # 低遅延重視は low_latency，画質重視は high_quality
 camera_stream_profile=low_latency
@@ -33,7 +35,7 @@ auto_threshold_enabled=true
 far_threshold=84
 near_threshold=76
 # AI制御周期(ms)。学習データ(0.1秒間隔)に合わせるなら100
-ai_control_interval_ms=100
+ai_control_interval_ms=50
 # UI更新周期(ms)
 ui_update_interval_ms=30
 
@@ -50,7 +52,7 @@ pid_stop_on_no_line=true
 # 学習ゲインの時間平滑化（0.0:平滑なし, 1.0:非常に強い追従）
 pid_gain_smoothing_alpha=0.40
 # 操舵量のフレーム間変化上限（小さいほど暴れにくい）
-pid_steer_rate_limit=0.20
+pid_steer_rate_limit=0.5
 # モータ符号補正（直進でその場回転する場合は見直す）
 motor_left_sign=-1
 motor_right_sign=1

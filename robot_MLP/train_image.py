@@ -1,22 +1,25 @@
 """
 End-to-End CNN training script.
 
-Input 1 : segmentation mask image  (1 × H × W, float32 in [0, 1])
+Input 1 : segmentation mask image stack  (N × H × W, float32 in [0, 1])
+          N = --history (default 5) 枚のマスク画像をチャンネル方向にスタック
           mask/ フォルダの PNG（セグメンテーション処理済み2値画像）を使用
-Input 2 : scalar state             (3,) = [current_left_norm, current_right_norm, base_speed_norm]
+Input 2 : scalar state                   (3,) = [current_left_norm, current_right_norm, base_speed_norm]
 Output  : [target_left_norm, target_right_norm]  ∈ [-1, 1]
 
 Usage example:
     python train_image.py \\
         --csv-path ../apps/dataset/camera_4 \\
         --img-h 60 --img-w 80 \\
+        --history 5 \\
         --epochs 50 --early-stopping \\
         --onnx-path model_cnn.onnx
 
-ONNX inputs (OpenCV DNN):
-    net.setInput(img_blob,    "image")    # (1, 1, H, W) float32 in [0, 1]
-    net.setInput(scalar_blob, "scalars")  # (1, 3)       float32
-    output = net.forward()               # (1, 2) float32 in [-1, 1]
+ONNX inputs (onnxruntime):
+    sess.run(None, {"image": img_blob, "scalars": scalar_blob})
+    img_blob    # (1, N, H, W) float32 in [0, 1]
+    scalar_blob # (1, 3)       float32
+    output      # (1, 2)       float32 in [-1, 1]
 """
 import argparse
 import csv
@@ -73,7 +76,7 @@ class _Row:
 class ImageDrivingDataset(Dataset):
     """
     One sample = (img_tensor, scalar_tensor, target_tensor)
-        img_tensor    : float32 (1, H, W) in [0, 1]
+        img_tensor    : float32 (N, H, W) in [0, 1]  N = n_history フレームのスタック
         scalar_tensor : float32 (3,)   [left_norm, right_norm, base_speed_norm]
         target_tensor : float32 (2,)   [target_left_norm, target_right_norm]
     """
@@ -84,6 +87,7 @@ class ImageDrivingDataset(Dataset):
         img_h: int = 60,
         img_w: int = 80,
         label_shift: int = 0,
+        n_history: int = 1,
     ) -> None:
         if not csv_paths:
             raise ValueError("csv_paths is empty")
@@ -93,6 +97,7 @@ class ImageDrivingDataset(Dataset):
         self.img_h = int(img_h)
         self.img_w = int(img_w)
         self.label_shift = int(label_shift)
+        self.n_history = max(1, int(n_history))
 
         self.sequences: List[List[_Row]] = []
         self.index_map: List[Tuple[int, int]] = []
@@ -146,11 +151,17 @@ class ImageDrivingDataset(Dataset):
         target_idx = min(row_idx + self.label_shift, len(seq) - 1)
         target = seq[target_idx].target
 
-        mask = cv2.imread(row.mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Mask image not found: {row.mask_path}")
-        mask = cv2.resize(mask, (self.img_w, self.img_h), interpolation=cv2.INTER_NEAREST)
-        img_tensor = torch.from_numpy(mask.astype(np.float32) / 255.0).unsqueeze(0)  # (1, H, W)
+        # n_history フレーム分のマスクを収集（不足分は先頭フレームで埋める）
+        frames: List[np.ndarray] = []
+        for k in range(self.n_history - 1, -1, -1):
+            fidx = max(0, row_idx - k)
+            f_row = seq[fidx]
+            f_mask = cv2.imread(f_row.mask_path, cv2.IMREAD_GRAYSCALE)
+            if f_mask is None:
+                raise FileNotFoundError(f"Mask image not found: {f_row.mask_path}")
+            f_mask = cv2.resize(f_mask, (self.img_w, self.img_h), interpolation=cv2.INTER_NEAREST)
+            frames.append(f_mask.astype(np.float32) / 255.0)
+        img_tensor = torch.from_numpy(np.stack(frames, axis=0))  # (N, H, W)
         scalar_tensor = torch.from_numpy(row.scalars.copy())
         target_tensor = torch.from_numpy(target.copy())
         return img_tensor, scalar_tensor, target_tensor
@@ -188,20 +199,21 @@ class LightCNNWithScalars(nn.Module):
     Lightweight End-to-End CNN with scalar motor state input.
 
     Architecture:
-        image (1, H, W) → Conv×4(stride=2) → Flatten(flat_dim)
+        image (N, H, W) → Conv×4(stride=2) → Flatten(flat_dim)
                                                                ↘
                                                         cat(flat_dim + 3) → FC → Tanh → (2,)
                                                                ↗
         scalars (3,) ─────────────────────────────────────────
 
-    Stride-2 convolutions (no MaxPool) for clean ONNX/OpenCV DNN compatibility.
+    N = n_history（時系列フレームのスタック数）
+    Stride-2 convolutions (no MaxPool) for clean ONNX compatibility.
     """
 
-    def __init__(self, img_h: int = 60, img_w: int = 80, hidden: int = 128) -> None:
+    def __init__(self, img_h: int = 60, img_w: int = 80, hidden: int = 128, n_history: int = 1) -> None:
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),   # H/2  W/2
+            nn.Conv2d(n_history, 16, kernel_size=3, stride=2, padding=1),   # H/2  W/2
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # H/4  W/4
             nn.ReLU(),
@@ -416,9 +428,9 @@ def train(args: argparse.Namespace) -> None:
         if not train_csvs:
             raise ValueError("No training CSVs after split. Dataset too small?")
 
-        train_set: Dataset = ImageDrivingDataset(train_csvs, args.img_h, args.img_w, args.label_shift)
+        train_set: Dataset = ImageDrivingDataset(train_csvs, args.img_h, args.img_w, args.label_shift, args.history)
         val_set: Optional[Dataset] = (
-            ImageDrivingDataset(val_csvs, args.img_h, args.img_w, args.label_shift)
+            ImageDrivingDataset(val_csvs, args.img_h, args.img_w, args.label_shift, args.history)
             if val_csvs else None
         )
         print(
@@ -428,7 +440,7 @@ def train(args: argparse.Namespace) -> None:
         if args.split_report_path:
             save_split_report(args.split_report_path, train_csvs, val_csvs, test_csvs)
     else:
-        full_set = ImageDrivingDataset(csv_paths, args.img_h, args.img_w, args.label_shift)
+        full_set = ImageDrivingDataset(csv_paths, args.img_h, args.img_w, args.label_shift, args.history)
         n = len(full_set)
         val_size = int(n * args.val_ratio)
         train_size = n - val_size
@@ -456,7 +468,7 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}  Mask image: {args.img_h}x{args.img_w}  Scalars: {SCALAR_COLUMNS}")
 
-    model = LightCNNWithScalars(img_h=args.img_h, img_w=args.img_w, hidden=args.hidden).to(device)
+    model = LightCNNWithScalars(img_h=args.img_h, img_w=args.img_w, hidden=args.hidden, n_history=args.history).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params:,}")
 
@@ -529,7 +541,7 @@ def train(args: argparse.Namespace) -> None:
 
     # ONNX export  (2 inputs: "image", "scalars")
     model_cpu = model.to("cpu").eval()
-    dummy_img = torch.zeros(1, 1, args.img_h, args.img_w, dtype=torch.float32)
+    dummy_img = torch.zeros(1, args.history, args.img_h, args.img_w, dtype=torch.float32)
     dummy_scalars = torch.zeros(1, N_SCALARS, dtype=torch.float32)
 
     export_kwargs = dict(
@@ -550,7 +562,7 @@ def train(args: argparse.Namespace) -> None:
         torch.onnx.export(model_cpu, (dummy_img, dummy_scalars), args.onnx_path, **export_kwargs)
 
     print(f"Exported ONNX model: {args.onnx_path}")
-    print(f"  Input 'image'  : (1, 1, {args.img_h}, {args.img_w})  float32 in [0, 1]")
+    print(f"  Input 'image'  : (1, {args.history}, {args.img_h}, {args.img_w})  float32 in [0, 1]")
     print(f"  Input 'scalars': (1, {N_SCALARS})  float32  {SCALAR_COLUMNS}")
     print(f"  Output 'motor_output': (1, 2)  float32 in [-1, 1]")
 
@@ -579,6 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="")
     p.add_argument("--weights-path", type=str, default="model_cnn.pt")
     p.add_argument("--onnx-path", type=str, default="model_cnn.onnx")
+    p.add_argument("--history", type=int, default=5,
+                   help="Number of consecutive frames to stack as input channels (default: 5)")
     p.add_argument("--label-shift", type=int, default=0,
                    help="Shift target N frames into the future (dpad delay compensation)")
     p.add_argument("--early-stopping", action="store_true")

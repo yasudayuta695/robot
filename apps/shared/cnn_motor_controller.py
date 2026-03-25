@@ -1,4 +1,5 @@
-from typing import Optional, Tuple
+from collections import deque
+from typing import Deque, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -11,7 +12,7 @@ class CnnMotorONNXController:
     OpenCV DNN は複数入力 ONNX 非対応のため onnxruntime を使用。
 
     Inputs (ONNX):
-        "image"  : (1, 1, img_h, img_w)  float32 in [0, 1]  ← セグメンテーションマスク
+        "image"  : (1, N, img_h, img_w)  float32 in [0, 1]  ← N フレームスタック（N = history）
         "scalars": (1, 3)                 float32            ← [left_norm, right_norm, base_speed_norm]
     Output:
         "motor_output": (1, 2)  float32 in [-1, 1]          ← [left_norm, right_norm]
@@ -21,6 +22,7 @@ class CnnMotorONNXController:
         self,
         img_h: int = 60,
         img_w: int = 80,
+        history: int = 1,
         smoothing_alpha: float = 0.35,
         max_motor_speed: int = 100,
         no_line_min_pixels: int = 10,
@@ -29,6 +31,7 @@ class CnnMotorONNXController:
     ) -> None:
         self.img_h = int(img_h)
         self.img_w = int(img_w)
+        self.history = max(1, int(history))
         self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
         self.max_motor_speed = int(max(1, max_motor_speed))
         self.no_line_min_pixels = int(max(1, no_line_min_pixels))
@@ -40,6 +43,7 @@ class CnnMotorONNXController:
         self._left_norm_prev: float = 0.0
         self._right_norm_prev: float = 0.0
         self._no_line_frames: int = 0
+        self._frame_buffer: Deque[np.ndarray] = deque(maxlen=self.history)
 
     def is_loaded(self) -> bool:
         return self._session is not None
@@ -50,6 +54,17 @@ class CnnMotorONNXController:
 
     def load_model(self, onnx_path: str) -> None:
         sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        # モデルの実際の入力チャンネル数（= history）を読み取って自動設定
+        img_shape = sess.get_inputs()[0].shape  # e.g. [1, 5, 60, 80] or ['batch', 1, 60, 80]
+        model_history = img_shape[1] if isinstance(img_shape[1], int) and img_shape[1] > 0 else self.history
+        if model_history != self.history:
+            import logging
+            logging.getLogger(__name__).info(
+                "CNN model history mismatch: controller=%d, model=%d → using model value",
+                self.history, model_history,
+            )
+            self.history = model_history
+            self._frame_buffer = deque(maxlen=self.history)
         self._session = sess
         self._model_path = onnx_path
         self.reset_state()
@@ -58,6 +73,7 @@ class CnnMotorONNXController:
         self._left_norm_prev = 0.0
         self._right_norm_prev = 0.0
         self._no_line_frames = 0
+        self._frame_buffer.clear()
 
     def _norm_to_speed(self, left_norm: float, right_norm: float) -> Tuple[int, int]:
         left = int(np.clip(round(left_norm * 100.0), -self.max_motor_speed, self.max_motor_speed))
@@ -96,10 +112,16 @@ class CnnMotorONNXController:
 
         self._no_line_frames = 0
 
-        # 前処理
+        # 前処理：現フレームをバッファに追加し、N フレームをスタック
         resized = cv2.resize(mask_gray, (self.img_w, self.img_h), interpolation=cv2.INTER_NEAREST)
-        img_blob = resized.astype(np.float32) / 255.0
-        img_blob = img_blob[np.newaxis, np.newaxis, :, :]  # (1, 1, H, W)
+        frame = resized.astype(np.float32) / 255.0  # (H, W)
+        self._frame_buffer.append(frame)
+
+        frames = list(self._frame_buffer)
+        # バッファが history に満たない場合は先頭フレームで埋める
+        while len(frames) < self.history:
+            frames.insert(0, frames[0])
+        img_blob = np.stack(frames, axis=0)[np.newaxis, :, :, :]  # (1, N, H, W)
 
         scalar_blob = np.array(
             [[
