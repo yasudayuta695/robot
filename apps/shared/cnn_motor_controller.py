@@ -24,6 +24,7 @@ class CnnMotorONNXController:
         img_w: int = 80,
         history: int = 1,
         smoothing_alpha: float = 0.35,
+        steer_rate_limit: float = 0.15,
         max_motor_speed: int = 100,
         no_line_min_pixels: int = 10,
         no_line_hold_frames: int = 3,
@@ -33,6 +34,7 @@ class CnnMotorONNXController:
         self.img_w = int(img_w)
         self.history = max(1, int(history))
         self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self.steer_rate_limit = float(max(1e-4, abs(steer_rate_limit)))
         self.max_motor_speed = int(max(1, max_motor_speed))
         self.no_line_min_pixels = int(max(1, no_line_min_pixels))
         self.no_line_hold_frames = max(0, int(no_line_hold_frames))
@@ -138,11 +140,18 @@ class CnnMotorONNXController:
         left_norm = float(np.clip(out[0], -1.0, 1.0))
         right_norm = float(np.clip(out[1], -1.0, 1.0))
 
-        # EMA 平滑化
+        # EMA 平滑化 + 出力変化率の制限
+        prev_left = self._left_norm_prev
+        prev_right = self._right_norm_prev
         a = self.smoothing_alpha
-        left_smooth = (1.0 - a) * self._left_norm_prev + a * left_norm
-        right_smooth = (1.0 - a) * self._right_norm_prev + a * right_norm
-        self._left_norm_prev = left_smooth
-        self._right_norm_prev = right_smooth
+        left_smooth = (1.0 - a) * prev_left + a * left_norm
+        right_smooth = (1.0 - a) * prev_right + a * right_norm
 
-        return self._norm_to_speed(left_smooth, right_smooth)
+        max_delta = self.steer_rate_limit
+        left_limited = prev_left + float(np.clip(left_smooth - prev_left, -max_delta, max_delta))
+        right_limited = prev_right + float(np.clip(right_smooth - prev_right, -max_delta, max_delta))
+
+        self._left_norm_prev = float(np.clip(left_limited, -1.0, 1.0))
+        self._right_norm_prev = float(np.clip(right_limited, -1.0, 1.0))
+
+        return self._norm_to_speed(self._left_norm_prev, self._right_norm_prev)

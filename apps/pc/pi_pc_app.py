@@ -305,6 +305,7 @@ class UnifiedApp:
         self.cnn_controller = CnnMotorONNXController(
             history=self.config.ai_history,
             smoothing_alpha=self.config.ai_smoothing_alpha,
+            steer_rate_limit=self.config.cnn_steer_rate_limit,
             max_motor_speed=100,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
@@ -315,6 +316,7 @@ class UnifiedApp:
         self._last_ai_control_time = 0.0
         self._last_pid_control_time = 0.0
         self._last_cnn_control_time = 0.0
+        self._curve_slowdown_scale_prev = 1.0
         self._pid_integral: float = 0.0
         self._pid_prev_error: float = 0.0
         self._pid_no_line_frames: int = 0
@@ -1244,13 +1246,34 @@ class UnifiedApp:
     def reset_cnn_state(self) -> None:
         self.cnn_controller.reset_state()
         self._last_cnn_control_time = 0.0
+        self._curve_slowdown_scale_prev = 1.0
 
     def _compute_curve_slowdown_scale(self, line_features: Dict[str, float]) -> float:
+        top_detect = float(line_features.get("line_detect_top", 0.0))
+        mid_detect = float(line_features.get("line_detect_mid", 0.0))
         top_offset = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
+        mid_offset = float(np.clip(line_features.get("line_offset_mid", 0.0), -1.0, 1.0))
         bottom_offset = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
+
+        # 近距離の曲率に加えて、上側オフセットで先読み減速する。
         curvature = abs(top_offset - bottom_offset)
-        slowdown = 1.0 - (float(self.config.curve_slowdown_sensitivity) * curvature)
-        return float(np.clip(slowdown, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+        lookahead = max(abs(top_offset), 0.70 * abs(mid_offset))
+        if top_detect <= 0.0 and mid_detect <= 0.0:
+            lookahead = 0.0
+        curve_signal = max(curvature, lookahead)
+
+        raw_scale = 1.0 - (float(self.config.curve_slowdown_sensitivity) * curve_signal)
+        raw_scale = float(np.clip(raw_scale, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+
+        # 減速は素早く、解除はゆっくりにしてカーブ出口の急加速を防ぐ。
+        prev = float(self._curve_slowdown_scale_prev)
+        attack_alpha = 0.75
+        release_alpha = 0.22
+        alpha = attack_alpha if raw_scale < prev else release_alpha
+        scale = ((1.0 - alpha) * prev) + (alpha * raw_scale)
+        scale = float(np.clip(scale, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+        self._curve_slowdown_scale_prev = scale
+        return scale
 
     def run_cnn_control(self, mask: np.ndarray, line_features: Dict[str, float]) -> None:
         if not self.cnn_controller.is_loaded():
