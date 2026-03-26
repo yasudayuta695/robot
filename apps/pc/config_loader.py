@@ -15,6 +15,7 @@ class AppConfig:
     dpad_drive_speed_scale: float
     dpad_turn_speed_scale: float
     curve_slowdown_sensitivity: float
+    curve_detection_mode: str
     ai_smoothing_alpha: float
     cnn_steer_rate_limit: float
     ai_history: int
@@ -50,6 +51,7 @@ def ensure_config_file(config_path: str, project_dir: str) -> None:
         f.write("dpad_drive_speed_scale=1.0\n")
         f.write("dpad_turn_speed_scale=0.5\n")
         f.write("curve_slowdown_sensitivity=0.70\n")
+        f.write("curve_detection_mode=feature\n")
         f.write("ai_smoothing_alpha=0.35\n")
         f.write("cnn_steer_rate_limit=0.15\n")
         f.write("ai_no_line_hold_frames=3\n")
@@ -85,6 +87,7 @@ def load_config(
     configured_dpad_drive_scale = default_dpad_drive_scale
     configured_dpad_turn_scale = default_dpad_turn_scale
     configured_curve_slowdown_sensitivity = 0.70
+    configured_curve_detection_mode = "feature"
     configured_ai_smoothing_alpha = 0.35
     configured_cnn_steer_rate_limit = 0.15
     configured_ai_history = 10
@@ -141,6 +144,8 @@ def load_config(
                         configured_curve_slowdown_sensitivity = float(value)
                     except ValueError:
                         logger.warning("Invalid curve_slowdown_sensitivity: %s", value)
+                elif key == "curve_detection_mode" and value:
+                    configured_curve_detection_mode = str(value).strip().lower()
                 elif key == "ai_smoothing_alpha" and value:
                     try:
                         configured_ai_smoothing_alpha = float(value)
@@ -267,6 +272,8 @@ def load_config(
         configured_dpad_turn_scale = default_dpad_turn_scale
 
     configured_curve_slowdown_sensitivity = max(0.0, min(2.0, float(configured_curve_slowdown_sensitivity)))
+    if configured_curve_detection_mode not in {"feature", "edge", "hybrid"}:
+        configured_curve_detection_mode = "feature"
     configured_ai_smoothing_alpha = max(0.0, min(1.0, float(configured_ai_smoothing_alpha)))
     configured_cnn_steer_rate_limit = max(0.01, min(1.0, float(configured_cnn_steer_rate_limit)))
     configured_ai_history = max(1, min(50, int(configured_ai_history)))
@@ -302,6 +309,7 @@ def load_config(
         dpad_drive_speed_scale=configured_dpad_drive_scale,
         dpad_turn_speed_scale=configured_dpad_turn_scale,
         curve_slowdown_sensitivity=configured_curve_slowdown_sensitivity,
+        curve_detection_mode=configured_curve_detection_mode,
         ai_smoothing_alpha=configured_ai_smoothing_alpha,
         cnn_steer_rate_limit=configured_cnn_steer_rate_limit,
         ai_history=configured_ai_history,
