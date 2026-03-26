@@ -1256,6 +1256,19 @@ class UnifiedApp:
                 current_right_speed=self.current_r_speed,
                 base_speed=self.get_drive_speed(),
             )
+            # カーブ検出 → 速度だけ落とす（操舵はCNNのまま）
+            top_off = abs(float(line_features.get("line_offset_top", 0.0)))
+            mid_off = abs(float(line_features.get("line_offset_mid", 0.0)))
+            btm_off = abs(float(line_features.get("line_offset_bottom", 0.0)))
+            curvature = abs(float(line_features.get("line_offset_top", 0.0))
+                           - float(line_features.get("line_offset_bottom", 0.0)))
+            curve_strength = float(np.clip(
+                max(mid_off, btm_off, 0.7 * top_off, 0.8 * curvature), 0.0, 1.0))
+            sens = float(self.config.curve_slowdown_sensitivity)
+            speed_scale = float(np.clip(1.0 - sens * curve_strength, 0.45, 1.0))
+            if speed_scale < 1.0:
+                left_speed = int(np.clip(round(left_speed * speed_scale), -100, 100))
+                right_speed = int(np.clip(round(right_speed * speed_scale), -100, 100))
             self.send_command(left_speed, right_speed)
         except Exception as exc:
             self.logger.warning("CNN inference failed: %s", exc)
