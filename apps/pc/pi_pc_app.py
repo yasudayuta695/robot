@@ -46,6 +46,7 @@ REVERSE_SPEED_SCALE = 0.8
 REVERSE_STRAIGHT_X_THRESHOLD = 0.2
 OUTER_SPEED_SCALE = 1.05
 INNER_SPEED_SCALE = 0.9
+CURVE_SLOWDOWN_MIN_SCALE = 0.45
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
@@ -1244,7 +1245,14 @@ class UnifiedApp:
         self.cnn_controller.reset_state()
         self._last_cnn_control_time = 0.0
 
-    def run_cnn_control(self, mask: np.ndarray) -> None:
+    def _compute_curve_slowdown_scale(self, line_features: Dict[str, float]) -> float:
+        top_offset = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
+        bottom_offset = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
+        curvature = abs(top_offset - bottom_offset)
+        slowdown = 1.0 - (float(self.config.curve_slowdown_sensitivity) * curvature)
+        return float(np.clip(slowdown, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+
+    def run_cnn_control(self, mask: np.ndarray, line_features: Dict[str, float]) -> None:
         if not self.cnn_controller.is_loaded():
             self.send_command(0, 0)
             return
@@ -1255,6 +1263,9 @@ class UnifiedApp:
                 current_right_speed=self.current_r_speed,
                 base_speed=self.get_drive_speed(),
             )
+            slowdown_scale = self._compute_curve_slowdown_scale(line_features)
+            left_speed = int(np.clip(round(left_speed * slowdown_scale), -100, 100))
+            right_speed = int(np.clip(round(right_speed * slowdown_scale), -100, 100))
             self.send_command(left_speed, right_speed)
         except Exception as exc:
             self.logger.warning("CNN inference failed: %s", exc)
@@ -1367,7 +1378,7 @@ class UnifiedApp:
         elif self.control_mode.get() == "cnn":
             if (now - self._last_cnn_control_time) >= self.ai_control_interval_sec:
                 if self._cached_mask is not None:
-                    self.run_cnn_control(self._cached_mask)
+                    self.run_cnn_control(self._cached_mask, line_features)
                 else:
                     self.send_command(0, 0)
                 self._last_cnn_control_time = now
