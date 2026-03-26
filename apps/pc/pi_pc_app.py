@@ -316,6 +316,9 @@ class UnifiedApp:
         self._last_pid_control_time = 0.0
         self._last_cnn_control_time = 0.0
         self._cnn_prev_steer: float = 0.0
+        self._cnn_prev_speed_norm: float = 0.0
+        self._cnn_curve_level: float = 0.0
+        self._cnn_curve_active: bool = False
         self._pid_integral: float = 0.0
         self._pid_prev_error: float = 0.0
         self._pid_no_line_frames: int = 0
@@ -1129,6 +1132,9 @@ class UnifiedApp:
             self.cnn_controller.reset_state()
             self._last_cnn_control_time = 0.0
             self._cnn_prev_steer = 0.0
+            self._cnn_prev_speed_norm = 0.0
+            self._cnn_curve_level = 0.0
+            self._cnn_curve_active = False
             if not self.cnn_controller.is_loaded():
                 self.load_cnn_model()
         else:
@@ -1247,6 +1253,9 @@ class UnifiedApp:
         self.cnn_controller.reset_state()
         self._last_cnn_control_time = 0.0
         self._cnn_prev_steer = 0.0
+        self._cnn_prev_speed_norm = 0.0
+        self._cnn_curve_level = 0.0
+        self._cnn_curve_active = False
 
     def _compute_curve_slowdown_scale(self, line_features: Dict[str, float]) -> float:
         top_detect = float(np.clip(line_features.get("line_detect_top", 0.0), 0.0, 1.0))
@@ -1287,11 +1296,28 @@ class UnifiedApp:
         offset_mag = max(abs(mid_offset), abs(bottom_offset), 0.70 * abs(top_offset))
         curve_strength = float(np.clip((0.55 * offset_mag) + (0.45 * curvature), 0.0, 1.0))
 
-        base_speed_norm = float(np.clip(self.get_drive_speed() / 100.0, 0.0, 1.0))
-        speed_norm *= (0.88 + (0.12 * detect_conf))
-        steer_target *= (1.00 + (0.55 * curve_strength))
+        self._cnn_curve_level = (0.82 * self._cnn_curve_level) + (0.18 * curve_strength)
+        if self._cnn_curve_active:
+            self._cnn_curve_active = self._cnn_curve_level >= 0.22
+        else:
+            self._cnn_curve_active = self._cnn_curve_level >= 0.35
+        curve_level = self._cnn_curve_level
 
-        max_delta = float(np.clip((0.08 + (0.18 * curve_strength)) - (0.02 * base_speed_norm), 0.07, 0.20))
+        base_speed_norm = float(np.clip(self.get_drive_speed() / 100.0, 0.0, 1.0))
+        speed_norm *= (0.90 + (0.10 * detect_conf))
+        if self._cnn_curve_active:
+            speed_norm *= (0.88 - (0.22 * curve_level))
+        steer_target *= (0.95 + (0.60 * curve_level))
+
+        speed_delta_limit = float(np.clip((0.09 - (0.05 * curve_level)) + (0.03 * detect_conf), 0.04, 0.11))
+        speed_delta = speed_norm - self._cnn_prev_speed_norm
+        if speed_delta > speed_delta_limit:
+            speed_norm = self._cnn_prev_speed_norm + speed_delta_limit
+        elif speed_delta < -speed_delta_limit:
+            speed_norm = self._cnn_prev_speed_norm - speed_delta_limit
+        self._cnn_prev_speed_norm = float(np.clip(speed_norm, -1.0, 1.0))
+
+        max_delta = float(np.clip((0.07 + (0.16 * curve_level)) - (0.02 * base_speed_norm), 0.06, 0.20))
         delta = steer_target - self._cnn_prev_steer
         if delta > max_delta:
             steer = self._cnn_prev_steer + max_delta
@@ -1300,7 +1326,7 @@ class UnifiedApp:
         else:
             steer = steer_target
         steer = float(np.clip(steer, -1.0, 1.0))
-        steer *= (0.90 + (0.10 * detect_conf))
+        steer *= (0.88 + (0.12 * detect_conf))
         self._cnn_prev_steer = steer
 
         left_out = float(np.clip(speed_norm + steer, -1.0, 1.0))
