@@ -46,11 +46,10 @@ REVERSE_SPEED_SCALE = 0.8
 REVERSE_STRAIGHT_X_THRESHOLD = 0.2
 OUTER_SPEED_SCALE = 1.05
 INNER_SPEED_SCALE = 0.9
-CURVE_SLOWDOWN_MIN_SCALE = 0.40
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
-DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg_v2.onnx")
+DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg_v3.onnx")
 DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
 COORD_STREAM_INTERVAL_SEC = 0.05
@@ -308,6 +307,7 @@ class UnifiedApp:
             max_motor_speed=100,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
+            steer_rate_limit=self.config.cnn_steer_rate_limit,
         )
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
@@ -315,8 +315,6 @@ class UnifiedApp:
         self._last_ai_control_time = 0.0
         self._last_pid_control_time = 0.0
         self._last_cnn_control_time = 0.0
-        self._cnn_prev_steer: float = 0.0
-        self._cnn_prev_speed_norm: float = 0.0
         self._pid_integral: float = 0.0
         self._pid_prev_error: float = 0.0
         self._pid_no_line_frames: int = 0
@@ -1129,8 +1127,6 @@ class UnifiedApp:
             self.dpad_frame.pack_forget()
             self.cnn_controller.reset_state()
             self._last_cnn_control_time = 0.0
-            self._cnn_prev_steer = 0.0
-            self._cnn_prev_speed_norm = 0.0
             if not self.cnn_controller.is_loaded():
                 self.load_cnn_model()
         else:
@@ -1248,75 +1244,6 @@ class UnifiedApp:
     def reset_cnn_state(self) -> None:
         self.cnn_controller.reset_state()
         self._last_cnn_control_time = 0.0
-        self._cnn_prev_steer = 0.0
-        self._cnn_prev_speed_norm = 0.0
-
-    def _compute_curve_slowdown_scale(self, line_features: Dict[str, float]) -> float:
-        top_detect = float(np.clip(line_features.get("line_detect_top", 0.0), 0.0, 1.0))
-        mid_detect = float(np.clip(line_features.get("line_detect_mid", 0.0), 0.0, 1.0))
-        btm_detect = float(np.clip(line_features.get("line_detect_bottom", 0.0), 0.0, 1.0))
-        detect_conf = float(np.clip((top_detect + mid_detect + btm_detect) / 3.0, 0.0, 1.0))
-
-        top_offset = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
-        mid_offset = float(np.clip(line_features.get("line_offset_mid", 0.0), -1.0, 1.0))
-        bottom_offset = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
-        curvature = abs(top_offset - bottom_offset)
-        offset_mag = max(abs(mid_offset), abs(bottom_offset), 0.70 * abs(top_offset))
-        curve_strength = float(np.clip((0.55 * offset_mag) + (0.45 * curvature), 0.0, 1.0))
-        slowdown = 1.0 - (float(self.config.curve_slowdown_sensitivity) * curve_strength)
-        slowdown *= (0.80 + (0.20 * detect_conf))
-        return float(np.clip(slowdown, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
-
-    def _stabilize_cnn_command(
-        self,
-        left_speed: int,
-        right_speed: int,
-        line_features: Dict[str, float],
-    ) -> Tuple[int, int]:
-        left_norm = float(np.clip(float(left_speed) / 100.0, -1.0, 1.0))
-        right_norm = float(np.clip(float(right_speed) / 100.0, -1.0, 1.0))
-        speed_norm = float(np.clip((left_norm + right_norm) * 0.5, -1.0, 1.0))
-        steer_target = float(np.clip((left_norm - right_norm) * 0.5, -1.0, 1.0))
-
-        top_detect = float(np.clip(line_features.get("line_detect_top", 0.0), 0.0, 1.0))
-        mid_detect = float(np.clip(line_features.get("line_detect_mid", 0.0), 0.0, 1.0))
-        btm_detect = float(np.clip(line_features.get("line_detect_bottom", 0.0), 0.0, 1.0))
-        detect_conf = float(np.clip((top_detect + mid_detect + btm_detect) / 3.0, 0.0, 1.0))
-
-        top_offset = float(np.clip(line_features.get("line_offset_top", 0.0), -1.0, 1.0))
-        mid_offset = float(np.clip(line_features.get("line_offset_mid", 0.0), -1.0, 1.0))
-        bottom_offset = float(np.clip(line_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
-        curvature = abs(top_offset - bottom_offset)
-        offset_mag = max(abs(mid_offset), abs(bottom_offset), 0.70 * abs(top_offset))
-        curve_strength = float(np.clip((0.55 * offset_mag) + (0.45 * curvature), 0.0, 1.0))
-
-        base_speed_norm = float(np.clip(self.get_drive_speed() / 100.0, 0.0, 1.0))
-        speed_norm *= (0.84 + (0.16 * detect_conf))
-        speed_norm *= (0.92 - (0.18 * curve_strength))
-        steer_target *= (0.90 + (0.40 * curve_strength))
-
-        speed_delta_limit = float(np.clip((0.06 - (0.02 * curve_strength)) + (0.02 * detect_conf), 0.03, 0.08))
-        speed_delta = speed_norm - self._cnn_prev_speed_norm
-        if speed_delta > speed_delta_limit:
-            speed_norm = self._cnn_prev_speed_norm + speed_delta_limit
-        elif speed_delta < -speed_delta_limit:
-            speed_norm = self._cnn_prev_speed_norm - speed_delta_limit
-        self._cnn_prev_speed_norm = float(np.clip(speed_norm, -1.0, 1.0))
-
-        steer_limit = float(np.clip((0.55 - (0.18 * base_speed_norm)) + (0.22 * curve_strength), 0.32, 0.62))
-        steer_target = float(np.clip(steer_target, -steer_limit, steer_limit))
-
-        steer_alpha = float(np.clip((0.22 + (0.18 * curve_strength)) - (0.08 * base_speed_norm), 0.16, 0.34))
-        steer = ((1.0 - steer_alpha) * self._cnn_prev_steer) + (steer_alpha * steer_target)
-        steer = float(np.clip(steer, -steer_limit, steer_limit))
-        steer *= (0.86 + (0.14 * detect_conf))
-        self._cnn_prev_steer = steer
-
-        left_out = float(np.clip(speed_norm + steer, -1.0, 1.0))
-        right_out = float(np.clip(speed_norm - steer, -1.0, 1.0))
-        left_out_speed = int(np.clip(round(left_out * 100.0), -100, 100))
-        right_out_speed = int(np.clip(round(right_out * 100.0), -100, 100))
-        return left_out_speed, right_out_speed
 
     def run_cnn_control(self, mask: np.ndarray, line_features: Dict[str, float]) -> None:
         if not self.cnn_controller.is_loaded():
@@ -1329,10 +1256,6 @@ class UnifiedApp:
                 current_right_speed=self.current_r_speed,
                 base_speed=self.get_drive_speed(),
             )
-            slowdown_scale = self._compute_curve_slowdown_scale(line_features)
-            left_speed = int(np.clip(round(left_speed * slowdown_scale), -100, 100))
-            right_speed = int(np.clip(round(right_speed * slowdown_scale), -100, 100))
-            left_speed, right_speed = self._stabilize_cnn_command(left_speed, right_speed, line_features)
             self.send_command(left_speed, right_speed)
         except Exception as exc:
             self.logger.warning("CNN inference failed: %s", exc)
