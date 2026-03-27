@@ -304,6 +304,7 @@ class UnifiedApp:
         self.cnn_controller = CnnMotorONNXController(
             history=self.config.ai_history,
             smoothing_alpha=self.config.ai_smoothing_alpha,
+            steer_rate_limit=self.config.cnn_steer_rate_limit,
             max_motor_speed=100,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
@@ -315,6 +316,7 @@ class UnifiedApp:
         self._last_ai_control_time = 0.0
         self._last_pid_control_time = 0.0
         self._last_cnn_control_time = 0.0
+        self._curve_slowdown_scale_prev = 1.0
         self._pid_integral: float = 0.0
         self._pid_prev_error: float = 0.0
         self._pid_no_line_frames: int = 0
@@ -1244,6 +1246,101 @@ class UnifiedApp:
     def reset_cnn_state(self) -> None:
         self.cnn_controller.reset_state()
         self._last_cnn_control_time = 0.0
+        self._curve_slowdown_scale_prev = 1.0
+
+    def _extract_curve_features_from_mask_edges(self, mask: np.ndarray) -> Dict[str, float]:
+        h, w = mask.shape[:2]
+        if h <= 0 or w <= 0:
+            return {}
+
+        roi_top = int(h * 0.25)
+        roi_h = h - roi_top
+        if roi_h < 6:
+            return {}
+
+        y1 = roi_top + (roi_h // 3)
+        y2 = roi_top + ((2 * roi_h) // 3)
+        zones = {
+            "top": (roi_top, y1),
+            "mid": (y1, y2),
+            "bottom": (y2, h),
+        }
+
+        features: Dict[str, float] = {}
+        half_w = max(1.0, float(w) * 0.5)
+        min_active_rows = 3
+
+        for zone, (y_start, y_end) in zones.items():
+            centers: List[float] = []
+            widths: List[float] = []
+            for y in range(max(0, y_start), min(h, y_end)):
+                xs = np.flatnonzero(mask[y] > 0)
+                if xs.size < 2:
+                    continue
+                left_x = float(xs[0])
+                right_x = float(xs[-1])
+                centers.append((left_x + right_x) * 0.5)
+                widths.append(right_x - left_x)
+
+            if len(centers) >= min_active_rows:
+                center_x = float(np.median(np.asarray(centers, dtype=np.float32)))
+                width_px = float(np.median(np.asarray(widths, dtype=np.float32)))
+                offset = float(np.clip((center_x - half_w) / half_w, -1.0, 1.0))
+                width_norm = float(np.clip(width_px / float(w), 0.0, 1.0))
+                features[f"line_detect_{zone}"] = 1.0
+                features[f"line_offset_{zone}"] = offset
+                features[f"line_width_{zone}"] = width_norm
+            else:
+                features[f"line_detect_{zone}"] = 0.0
+                features[f"line_offset_{zone}"] = 0.0
+                features[f"line_width_{zone}"] = 0.0
+
+        return features
+
+    def _compute_curve_slowdown_scale(self, line_features: Dict[str, float], mask: Optional[np.ndarray] = None) -> float:
+        source_mode = str(getattr(self.config, "curve_detection_mode", "feature")).strip().lower()
+        curve_features = dict(line_features)
+
+        if mask is not None and source_mode in {"edge", "hybrid"}:
+            edge_features = self._extract_curve_features_from_mask_edges(mask)
+            if source_mode == "edge" and edge_features:
+                curve_features = edge_features
+            elif source_mode == "hybrid" and edge_features:
+                for zone in ("top", "mid", "bottom"):
+                    edge_detect = float(edge_features.get(f"line_detect_{zone}", 0.0))
+                    base_detect = float(curve_features.get(f"line_detect_{zone}", 0.0))
+                    if edge_detect > 0.0:
+                        curve_features[f"line_detect_{zone}"] = 1.0
+                        curve_features[f"line_offset_{zone}"] = float(edge_features.get(f"line_offset_{zone}", 0.0))
+                        curve_features[f"line_width_{zone}"] = float(edge_features.get(f"line_width_{zone}", 0.0))
+                    else:
+                        curve_features[f"line_detect_{zone}"] = base_detect
+
+        top_detect = float(curve_features.get("line_detect_top", 0.0))
+        mid_detect = float(curve_features.get("line_detect_mid", 0.0))
+        top_offset = float(np.clip(curve_features.get("line_offset_top", 0.0), -1.0, 1.0))
+        mid_offset = float(np.clip(curve_features.get("line_offset_mid", 0.0), -1.0, 1.0))
+        bottom_offset = float(np.clip(curve_features.get("line_offset_bottom", 0.0), -1.0, 1.0))
+
+        # 近距離の曲率に加えて、上側オフセットで先読み減速する。
+        curvature = abs(top_offset - bottom_offset)
+        lookahead = max(abs(top_offset), 0.70 * abs(mid_offset))
+        if top_detect <= 0.0 and mid_detect <= 0.0:
+            lookahead = 0.0
+        curve_signal = max(curvature, lookahead)
+
+        raw_scale = 1.0 - (float(self.config.curve_slowdown_sensitivity) * curve_signal)
+        raw_scale = float(np.clip(raw_scale, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+
+        # 減速は素早く、解除はゆっくりにしてカーブ出口の急加速を防ぐ。
+        prev = float(self._curve_slowdown_scale_prev)
+        attack_alpha = 0.75
+        release_alpha = 0.22
+        alpha = attack_alpha if raw_scale < prev else release_alpha
+        scale = ((1.0 - alpha) * prev) + (alpha * raw_scale)
+        scale = float(np.clip(scale, CURVE_SLOWDOWN_MIN_SCALE, 1.0))
+        self._curve_slowdown_scale_prev = scale
+        return scale
 
     def run_cnn_control(self, mask: np.ndarray, line_features: Dict[str, float]) -> None:
         if not self.cnn_controller.is_loaded():
@@ -1256,19 +1353,9 @@ class UnifiedApp:
                 current_right_speed=self.current_r_speed,
                 base_speed=self.get_drive_speed(),
             )
-            # カーブ検出 → 速度だけ落とす（操舵はCNNのまま）
-            top_off = abs(float(line_features.get("line_offset_top", 0.0)))
-            mid_off = abs(float(line_features.get("line_offset_mid", 0.0)))
-            btm_off = abs(float(line_features.get("line_offset_bottom", 0.0)))
-            curvature = abs(float(line_features.get("line_offset_top", 0.0))
-                           - float(line_features.get("line_offset_bottom", 0.0)))
-            curve_strength = float(np.clip(
-                max(mid_off, btm_off, 0.7 * top_off, 0.8 * curvature), 0.0, 1.0))
-            sens = float(self.config.curve_slowdown_sensitivity)
-            speed_scale = float(np.clip(1.0 - sens * curve_strength, 0.45, 1.0))
-            if speed_scale < 1.0:
-                left_speed = int(np.clip(round(left_speed * speed_scale), -100, 100))
-                right_speed = int(np.clip(round(right_speed * speed_scale), -100, 100))
+            slowdown_scale = self._compute_curve_slowdown_scale(line_features, mask=mask)
+            left_speed = int(np.clip(round(left_speed * slowdown_scale), -100, 100))
+            right_speed = int(np.clip(round(right_speed * slowdown_scale), -100, 100))
             self.send_command(left_speed, right_speed)
         except Exception as exc:
             self.logger.warning("CNN inference failed: %s", exc)
