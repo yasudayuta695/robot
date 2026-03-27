@@ -29,6 +29,7 @@ class CnnMotorONNXController:
         no_line_min_pixels: int = 10,
         no_line_hold_frames: int = 3,
         no_line_brake_frames: int = 8,
+        steer_rate_limit: float = 0.15,
     ) -> None:
         self.img_h = int(img_h)
         self.img_w = int(img_w)
@@ -39,12 +40,14 @@ class CnnMotorONNXController:
         self.no_line_min_pixels = int(max(1, no_line_min_pixels))
         self.no_line_hold_frames = max(0, int(no_line_hold_frames))
         self.no_line_brake_frames = max(1, int(no_line_brake_frames))
+        self.steer_rate_limit = float(max(1e-4, abs(steer_rate_limit)))
 
         self._session: Optional[ort.InferenceSession] = None
         self._model_path: str = ""
         self._left_norm_prev: float = 0.0
         self._right_norm_prev: float = 0.0
         self._no_line_frames: int = 0
+        self._last_steer: float = 0.0
         self._frame_buffer: Deque[np.ndarray] = deque(maxlen=self.history)
 
     def is_loaded(self) -> bool:
@@ -75,6 +78,7 @@ class CnnMotorONNXController:
         self._left_norm_prev = 0.0
         self._right_norm_prev = 0.0
         self._no_line_frames = 0
+        self._last_steer = 0.0
         self._frame_buffer.clear()
 
     def _norm_to_speed(self, left_norm: float, right_norm: float) -> Tuple[int, int]:

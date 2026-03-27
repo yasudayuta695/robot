@@ -28,6 +28,7 @@ class AppConfig:
     pid_integral_limit: float
     pid_gain_smoothing_alpha: float
     pid_steer_rate_limit: float
+    cnn_steer_rate_limit: float
     line_process_interval_ms: int
     ai_control_interval_ms: int
     ui_update_interval_ms: int
@@ -100,6 +101,7 @@ def load_config(
     configured_pid_integral_limit = 1.5
     configured_pid_gain_smoothing_alpha = 0.25
     configured_pid_steer_rate_limit = 0.18
+    configured_cnn_steer_rate_limit = 0.15
     configured_line_process_interval_ms = 70
     configured_ai_control_interval_ms = 100
     configured_ui_update_interval_ms = 30
@@ -206,6 +208,11 @@ def load_config(
                         configured_pid_steer_rate_limit = float(value)
                     except ValueError:
                         logger.warning("Invalid pid_steer_rate_limit: %s", value)
+                elif key == "cnn_steer_rate_limit" and value:
+                    try:
+                        configured_cnn_steer_rate_limit = float(value)
+                    except ValueError:
+                        logger.warning("Invalid cnn_steer_rate_limit: %s", value)
                 elif key == "line_process_interval_ms" and value:
                     try:
                         configured_line_process_interval_ms = int(float(value))
@@ -286,6 +293,7 @@ def load_config(
     configured_pid_integral_limit = max(0.0, min(10.0, float(configured_pid_integral_limit)))
     configured_pid_gain_smoothing_alpha = max(0.0, min(1.0, float(configured_pid_gain_smoothing_alpha)))
     configured_pid_steer_rate_limit = max(0.01, min(1.0, float(configured_pid_steer_rate_limit)))
+    configured_cnn_steer_rate_limit = max(0.01, min(1.0, float(configured_cnn_steer_rate_limit)))
     configured_line_process_interval_ms = max(20, min(300, int(configured_line_process_interval_ms)))
     configured_ai_control_interval_ms = max(20, min(300, int(configured_ai_control_interval_ms)))
     configured_ui_update_interval_ms = max(10, min(100, int(configured_ui_update_interval_ms)))
@@ -322,6 +330,7 @@ def load_config(
         pid_integral_limit=configured_pid_integral_limit,
         pid_gain_smoothing_alpha=configured_pid_gain_smoothing_alpha,
         pid_steer_rate_limit=configured_pid_steer_rate_limit,
+        cnn_steer_rate_limit=configured_cnn_steer_rate_limit,
         line_process_interval_ms=configured_line_process_interval_ms,
         ai_control_interval_ms=configured_ai_control_interval_ms,
         ui_update_interval_ms=configured_ui_update_interval_ms,

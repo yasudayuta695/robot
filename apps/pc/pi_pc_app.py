@@ -46,11 +46,10 @@ REVERSE_SPEED_SCALE = 0.8
 REVERSE_STRAIGHT_X_THRESHOLD = 0.2
 OUTER_SPEED_SCALE = 1.05
 INNER_SPEED_SCALE = 0.9
-CURVE_SLOWDOWN_MIN_SCALE = 0.45
 DEFAULT_DPAD_DRIVE_SPEED_SCALE = 1.0
 DEFAULT_DPAD_TURN_SPEED_SCALE = 30.0 / 60.0
 DEFAULT_AI_MODEL_REL_PATH = os.path.join("robot_MLP", "model.onnx")
-DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg_v2.onnx")
+DEFAULT_SEG_MODEL_REL_PATH = os.path.join("robot_seg", "model_seg_v3.onnx")
 DATA_RECORD_INTERVAL_SEC = 0.1
 EMERGENCY_STOP_KEYS = {"space", "Escape"}
 COORD_STREAM_INTERVAL_SEC = 0.05
@@ -309,6 +308,7 @@ class UnifiedApp:
             max_motor_speed=100,
             no_line_hold_frames=self.config.ai_no_line_hold_frames,
             no_line_brake_frames=self.config.ai_no_line_brake_frames,
+            steer_rate_limit=self.config.cnn_steer_rate_limit,
         )
         self.line_process_interval_sec = max(0.02, float(self.config.line_process_interval_ms) / 1000.0)
         self.ai_control_interval_sec = max(0.02, float(self.config.ai_control_interval_ms) / 1000.0)
